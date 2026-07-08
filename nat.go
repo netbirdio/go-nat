@@ -45,9 +45,10 @@ func DiscoverNATs(ctx context.Context) <-chan NAT {
 
 		upnpIg1 := discoverUPNP_IG1(ctx)
 		upnpIg2 := discoverUPNP_IG2(ctx)
+		upnpUnicast := discoverUPNP_Unicast(ctx)
 		natpmp := discoverNATPMP(ctx)
 		upnpGenIGDev := discoverUPNP_GenIGDev(ctx)
-		for upnpIg1 != nil || upnpIg2 != nil || natpmp != nil || upnpGenIGDev != nil {
+		for upnpIg1 != nil || upnpIg2 != nil || upnpUnicast != nil || natpmp != nil || upnpGenIGDev != nil {
 			var (
 				nat NAT
 				ok  bool
@@ -60,6 +61,10 @@ func DiscoverNATs(ctx context.Context) <-chan NAT {
 			case nat, ok = <-upnpIg2:
 				if !ok {
 					upnpIg2 = nil
+				}
+			case nat, ok = <-upnpUnicast:
+				if !ok {
+					upnpUnicast = nil
 				}
 			case nat, ok = <-upnpGenIGDev:
 				if !ok {
