@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -118,8 +119,13 @@ func DiscoverGateway(ctx context.Context) (NAT, error) {
 	return bestNAT, nil
 }
 
-var random = rand.New(rand.NewSource(time.Now().UnixNano()))
+var (
+	random   = rand.New(rand.NewSource(time.Now().UnixNano()))
+	randomMu sync.Mutex
+)
 
 func randomPort() int {
+	randomMu.Lock()
+	defer randomMu.Unlock()
 	return random.Intn(math.MaxUint16-10000) + 10000
 }
