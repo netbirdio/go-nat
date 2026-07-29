@@ -37,96 +37,113 @@ type NAT interface {
 }
 
 // DiscoverNATs returns all NATs discovered in the network.
+// Callers choose between the returned protocols; use DiscoverGateway for
+// PCP preference and automatic dual-stack mapping.
 func DiscoverNATs(ctx context.Context) <-chan NAT {
+	return mergeNATs(ctx, discoverFallbackNATs(ctx), discoverPCP(ctx))
+}
+
+func discoverFallbackNATs(ctx context.Context) <-chan NAT {
+	return mergeNATs(ctx,
+		discoverUPNP_IG1(ctx),
+		discoverUPNP_IG2(ctx),
+		discoverUPNP_Unicast(ctx),
+		discoverUPNP_GenIGDev(ctx),
+		discoverNATPMP(ctx),
+	)
+}
+
+func mergeNATs(ctx context.Context, sources ...<-chan NAT) <-chan NAT {
 	nats := make(chan NAT)
+	var wg sync.WaitGroup
 
-	go func() {
-		defer close(nats)
-
-		upnpIg1 := discoverUPNP_IG1(ctx)
-		upnpIg2 := discoverUPNP_IG2(ctx)
-		upnpUnicast := discoverUPNP_Unicast(ctx)
-		natpmp := discoverNATPMP(ctx)
-		pcp := discoverPCP(ctx)
-		upnpGenIGDev := discoverUPNP_GenIGDev(ctx)
-		for upnpIg1 != nil || upnpIg2 != nil || upnpUnicast != nil || natpmp != nil || pcp != nil || upnpGenIGDev != nil {
-			var (
-				nat NAT
-				ok  bool
-			)
-			select {
-			case nat, ok = <-upnpIg1:
-				if !ok {
-					upnpIg1 = nil
-				}
-			case nat, ok = <-upnpIg2:
-				if !ok {
-					upnpIg2 = nil
-				}
-			case nat, ok = <-upnpUnicast:
-				if !ok {
-					upnpUnicast = nil
-				}
-			case nat, ok = <-upnpGenIGDev:
-				if !ok {
-					upnpGenIGDev = nil
-				}
-			case nat, ok = <-natpmp:
-				if !ok {
-					natpmp = nil
-				}
-			case nat, ok = <-pcp:
-				if !ok {
-					pcp = nil
-				}
-			case <-ctx.Done():
-				// timeout.
-				return
-			}
-			if ok {
+	for _, source := range sources {
+		if source == nil {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
 				select {
-				case nats <- nat:
+				case nat, ok := <-source:
+					if !ok {
+						return
+					}
+					select {
+					case nats <- nat:
+					case <-ctx.Done():
+						return
+					}
 				case <-ctx.Done():
 					return
 				}
 			}
-		}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(nats)
 	}()
 	return nats
 }
 
-// DiscoverGateway attempts to find a gateway device.
+// DiscoverGateway attempts to find a gateway device. It prefers PCP for IPv4,
+// independently enables PCP for IPv6, then falls back to the first UPnP or
+// NAT-PMP gateway discovered.
 func DiscoverGateway(ctx context.Context) (NAT, error) {
-	var nats []NAT
-	for nat := range DiscoverNATs(ctx) {
-		nats = append(nats, nat)
-	}
-	switch len(nats) {
-	case 0:
-		return nil, ErrNoNATFound
-	case 1:
-		return nats[0], nil
-	}
-	gw, _ := getDefaultGateway()
-	bestNAT := nats[0]
-	natGw, _ := bestNAT.GetDeviceAddress()
-	bestNATIsGw := gw != nil && natGw.Equal(gw)
-	// 1. Prefer gateways discovered _last_. This is an OK heuristic for
-	// discovering the most-upstream (furthest) NAT.
-	// 2. Prefer gateways that actually match our known gateway address.
-	// Some relays like to claim to be NATs even if they aren't.
-	for _, nat := range nats[1:] {
-		natGw, _ := nat.GetDeviceAddress()
-		natIsGw := gw != nil && natGw.Equal(gw)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-		if bestNATIsGw && !natIsGw {
-			continue
+	return selectGateway(ctx, discoverPCPv4(ctx), discoverPCPv6(ctx), discoverFallbackNATs(ctx))
+}
+
+func selectGateway(ctx context.Context, pcp4s <-chan NAT, pcp6s <-chan pcpPortMapper, fallbacks <-chan NAT) (NAT, error) {
+	var pcp4NAT, fallback NAT
+	var pcp6 pcpPortMapper
+	ctxDone := ctx.Done()
+
+	for {
+		if pcp4s == nil && pcp6s == nil && (pcp4NAT != nil || fallback != nil || fallbacks == nil) {
+			break
 		}
 
-		bestNATIsGw = natIsGw
-		bestNAT = nat
+		select {
+		case nat, ok := <-pcp4s:
+			pcp4s = nil
+			if ok {
+				pcp4NAT = nat
+			}
+		case client, ok := <-pcp6s:
+			pcp6s = nil
+			if ok {
+				pcp6 = client
+			}
+		case nat, ok := <-fallbacks:
+			if !ok {
+				fallbacks = nil
+			} else if fallback == nil {
+				fallback = nat
+			}
+		case <-ctxDone:
+			// Let successful PCP discovery already in flight publish its buffered
+			// result before choosing a fallback.
+			ctxDone = nil
+		}
 	}
-	return bestNAT, nil
+
+	gateway := pcp4NAT
+	if gateway == nil {
+		gateway = fallback
+	}
+	if gateway == nil {
+		return nil, ErrNoNATFound
+	}
+	if pcp6 != nil {
+		gateway = newNATWithPCPIPv6(gateway, pcp6)
+	}
+	return gateway, nil
 }
 
 var (
