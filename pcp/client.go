@@ -294,7 +294,7 @@ func (c *Client) sendRequest(ctx context.Context, req []byte) ([]byte, error) {
 		return nil, errors.New("gateway IP not set")
 	}
 
-	addr := &net.UDPAddr{IP: c.gateway.AsSlice(), Port: Port}
+	addr := &net.UDPAddr{IP: c.gateway.AsSlice(), Port: Port, Zone: c.gateway.Zone()}
 
 	var lastErr error
 	delay := initialRetryDelay
@@ -336,6 +336,10 @@ func retryDelayWithJitter(d time.Duration) time.Duration {
 }
 
 func (c *Client) sendOnce(ctx context.Context, addr *net.UDPAddr, req []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Use ListenUDP instead of DialUDP to validate response source address per RFC 6887 §8.3.
 	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
@@ -360,6 +364,10 @@ func (c *Client) sendOnce(ctx context.Context, addr *net.UDPAddr, req []byte) ([
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, fmt.Errorf("set deadline: %w", err)
 	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	defer stopCancel()
 
 	if _, err := conn.WriteToUDP(req, addr); err != nil {
 		return nil, fmt.Errorf("write: %w", err)
@@ -368,6 +376,9 @@ func (c *Client) sendOnce(ctx context.Context, addr *net.UDPAddr, req []byte) ([
 	resp := make([]byte, responseBufferSize)
 	n, from, err := conn.ReadFromUDP(resp)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("read: %w", err)
 	}
 
