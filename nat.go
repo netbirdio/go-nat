@@ -102,7 +102,6 @@ func DiscoverGateway(ctx context.Context) (NAT, error) {
 func selectGateway(ctx context.Context, pcp4s <-chan NAT, pcp6s <-chan pcpPortMapper, fallbacks <-chan NAT) (NAT, error) {
 	var pcp4NAT, fallback NAT
 	var pcp6 pcpPortMapper
-	ctxDone := ctx.Done()
 
 	for {
 		if pcp4s == nil && pcp6s == nil && (pcp4NAT != nil || fallback != nil || fallbacks == nil) {
@@ -126,10 +125,32 @@ func selectGateway(ctx context.Context, pcp4s <-chan NAT, pcp6s <-chan pcpPortMa
 			} else if fallback == nil {
 				fallback = nat
 			}
-		case <-ctxDone:
-			// Let successful PCP discovery already in flight publish its buffered
-			// result before choosing a fallback.
-			ctxDone = nil
+		case <-ctx.Done():
+			// Collect results already published (sources use buffered channels),
+			// then stop waiting on anything still in flight.
+			for pcp4s != nil || pcp6s != nil || fallbacks != nil {
+				select {
+				case nat, ok := <-pcp4s:
+					pcp4s = nil
+					if ok {
+						pcp4NAT = nat
+					}
+				case client, ok := <-pcp6s:
+					pcp6s = nil
+					if ok {
+						pcp6 = client
+					}
+				case nat, ok := <-fallbacks:
+					if !ok {
+						fallbacks = nil
+					} else if fallback == nil {
+						fallback = nat
+					}
+				default:
+					// Empty all channels to stop waiting on them.
+					pcp4s, pcp6s, fallbacks = nil, nil, nil
+				}
+			}
 		}
 	}
 

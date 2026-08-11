@@ -82,18 +82,12 @@ func TestMergeNATs(t *testing.T) {
 func TestSelectGatewayPrefersPCPv4(t *testing.T) {
 	pcp4 := &fakeNAT{typ: "PCP"}
 	fallback := &fakeNAT{typ: "UPnP"}
-	pcp4s := make(chan NAT)
-	fallbacks := make(chan NAT)
-	go func() {
-		fallbacks <- fallback
-		close(fallbacks)
-		pcp4s <- pcp4
-		close(pcp4s)
-	}()
 
+	// Results already published when the context is cancelled must still be
+	// collected, with PCP preferred over the fallback.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	got, err := selectGateway(ctx, pcp4s, results[pcpPortMapper](), fallbacks)
+	got, err := selectGateway(ctx, results[NAT](pcp4), results[pcpPortMapper](), results[NAT](fallback))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,6 +163,32 @@ func TestDualStackDeleteSurfacesIPv6Error(t *testing.T) {
 
 	if err := gateway.DeletePortMapping(context.Background(), "tcp", 1234); !errors.Is(err, v6Err) {
 		t.Fatalf("DeletePortMapping() error = %v, want %v", err, v6Err)
+	}
+}
+
+func TestSelectGatewayAbortsOnCancelledContext(t *testing.T) {
+	// Sources that never publish and never close, like discovery probes stuck
+	// on an unresponsive network.
+	stuck4 := make(chan NAT)
+	stuck6 := make(chan pcpPortMapper)
+	stuckFallbacks := make(chan NAT)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := selectGateway(ctx, stuck4, stuck6, stuckFallbacks)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("selectGateway() error = nil, want non-nil on cancelled context")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("selectGateway did not return after context cancellation")
 	}
 }
 
