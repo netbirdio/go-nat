@@ -38,6 +38,14 @@ type Client struct {
 	externalIP netip.Addr
 	// epochStateLost is set when epoch indicates server restart.
 	epochStateLost bool
+	// nonces holds the nonce for each active mapping; RFC 6887 requires
+	// renewals and deletes to reuse the nonce the mapping was created with.
+	nonces map[mappingKey][12]byte
+}
+
+type mappingKey struct {
+	proto uint8
+	port  uint16
 }
 
 // NewClient creates a new PCP client for the gateway at the given IP.
@@ -144,11 +152,6 @@ func (c *Client) addPortMappingWithHint(ctx context.Context, protocol string, in
 		return nil, fmt.Errorf("parse protocol: %w", err)
 	}
 
-	var nonce [12]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return nil, fmt.Errorf("generate nonce: %w", err)
-	}
-
 	// Convert lifetime to seconds. Lifetime 0 means delete, so only apply the
 	// default for positive durations that round to 0 seconds.
 	var lifetimeSec uint32
@@ -158,6 +161,26 @@ func (c *Client) addPortMappingWithHint(ctx context.Context, protocol string, in
 			lifetimeSec = DefaultLifetime
 		}
 	}
+
+	key := mappingKey{proto: proto, port: uint16(internalPort)}
+	c.mu.Lock()
+	nonce, haveNonce := c.nonces[key]
+	if !haveNonce {
+		if _, err := rand.Read(nonce[:]); err != nil {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("generate nonce: %w", err)
+		}
+	}
+	// Store the nonce before sending: if the server creates the mapping but
+	// the response is lost, a later delete must still present this nonce or
+	// the server answers NOT_AUTHORIZED and the mapping leaks (RFC 6887 §11.3).
+	if lifetimeSec > 0 {
+		if c.nonces == nil {
+			c.nonces = make(map[mappingKey][12]byte)
+		}
+		c.nonces[key] = nonce
+	}
+	c.mu.Unlock()
 
 	req := buildMapRequest(localIP, nonce, proto, uint16(internalPort), uint16(suggestedExtPort), suggestedExtIP, lifetimeSec)
 
@@ -190,17 +213,18 @@ func (c *Client) addPortMappingWithHint(ctx context.Context, protocol string, in
 	c.mu.Lock()
 	c.updateEpochLocked(mapResp.Epoch)
 	c.cacheExternalIPLocked(mapResp.ExternalIP)
+	if lifetimeSec == 0 {
+		delete(c.nonces, key)
+	}
 	c.mu.Unlock()
 	return mapResp, nil
 }
 
 // DeletePortMapping removes a port mapping by requesting zero lifetime.
+// Deleting a nonexistent mapping succeeds (RFC 6887 §15.1), so any error is
+// a real failure and is returned.
 func (c *Client) DeletePortMapping(ctx context.Context, protocol string, internalPort int) error {
 	if _, err := c.addPortMappingWithHint(ctx, protocol, internalPort, 0, netip.Addr{}, 0); err != nil {
-		var pcpErr *Error
-		if errors.As(err, &pcpErr) && pcpErr.Code == ResultNotAuthorized {
-			return nil
-		}
 		return fmt.Errorf("delete mapping: %w", err)
 	}
 	return nil

@@ -2,11 +2,187 @@ package pcp
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
+	"net/netip"
+	"sync"
 	"testing"
 	"time"
 )
+
+// fakePCPServer is a minimal RFC 6887 server. It enforces the MAP nonce rules
+// (§11.3, §15.1): a MAP request for an existing mapping whose nonce differs is
+// answered with NOT_AUTHORIZED and the mapping is left untouched.
+type fakePCPServer struct {
+	conn *net.UDPConn
+
+	mu       sync.Mutex
+	mappings map[mappingKey][12]byte
+	// corruptNext truncates the next MAP response: the server creates the
+	// mapping but the client cannot parse the reply.
+	corruptNext bool
+}
+
+func newFakePCPServer(t *testing.T, network, addr string) *fakePCPServer {
+	t.Helper()
+	udpAddr, err := net.ResolveUDPAddr(network, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.ListenUDP(network, udpAddr)
+	if err != nil {
+		t.Fatalf("bind fake PCP server on %s: %v", addr, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	server := &fakePCPServer{conn: conn, mappings: make(map[mappingKey][12]byte)}
+	go server.serve()
+	return server
+}
+
+func (s *fakePCPServer) serve() {
+	buf := make([]byte, 128)
+	for {
+		n, from, err := s.conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		if resp := s.handle(buf[:n]); resp != nil {
+			_, _ = s.conn.WriteToUDP(resp, from)
+		}
+	}
+}
+
+func (s *fakePCPServer) handle(req []byte) []byte {
+	if len(req) < headerSize || req[0] != Version {
+		return nil
+	}
+
+	const epoch = 1000
+	switch req[1] {
+	case OpAnnounce:
+		resp := make([]byte, headerSize)
+		resp[0] = Version
+		resp[1] = OpAnnounce | OpReply
+		binary.BigEndian.PutUint32(resp[8:12], epoch)
+		return resp
+	case OpMap:
+		if len(req) < mapRequestSize {
+			return nil
+		}
+		lifetime := binary.BigEndian.Uint32(req[4:8])
+		var nonce [12]byte
+		copy(nonce[:], req[24:36])
+		key := mappingKey{proto: req[36], port: binary.BigEndian.Uint16(req[40:42])}
+
+		resp := make([]byte, mapRequestSize)
+		resp[0] = Version
+		resp[1] = OpMap | OpReply
+		binary.BigEndian.PutUint32(resp[4:8], lifetime)
+		binary.BigEndian.PutUint32(resp[8:12], epoch)
+		copy(resp[24:36], nonce[:])
+		resp[36] = key.proto
+		binary.BigEndian.PutUint16(resp[40:42], key.port)
+		binary.BigEndian.PutUint16(resp[42:44], key.port)
+		extIP := addrTo16(netip.MustParseAddr("192.0.2.1"))
+		copy(resp[44:60], extIP[:])
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if stored, ok := s.mappings[key]; ok && stored != nonce {
+			resp[3] = ResultNotAuthorized
+			binary.BigEndian.PutUint32(resp[4:8], 0)
+			return resp
+		}
+		if lifetime == 0 {
+			delete(s.mappings, key)
+		} else {
+			s.mappings[key] = nonce
+		}
+		if s.corruptNext {
+			s.corruptNext = false
+			return resp[:headerSize]
+		}
+		return resp
+	}
+	return nil
+}
+
+func (s *fakePCPServer) hasMapping(proto uint8, port uint16) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.mappings[mappingKey{proto: proto, port: port}]
+	return ok
+}
+
+// RFC 6887 requires renewals and deletes to carry the nonce the mapping was
+// created with; a server answers a different nonce with NOT_AUTHORIZED.
+func TestPortMappingNonceReuse(t *testing.T) {
+	server := newFakePCPServer(t, "udp4", "127.0.0.1:5351")
+
+	newTestClient := func() *Client {
+		client := NewClientWithTimeout(net.IPv4(127, 0, 0, 1), time.Second)
+		client.SetLocalIP(net.IPv4(127, 0, 0, 1))
+		return client
+	}
+
+	t.Run("renew reuses create nonce", func(t *testing.T) {
+		client := newTestClient()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if _, err := client.AddPortMapping(ctx, "udp", 4444, time.Hour); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+		if _, err := client.AddPortMapping(ctx, "udp", 4444, time.Hour); err != nil {
+			t.Fatalf("renew mapping: %v (renew must reuse the create nonce)", err)
+		}
+	})
+
+	t.Run("delete reuses nonce of create whose response was lost", func(t *testing.T) {
+		client := newTestClient()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		server.mu.Lock()
+		server.corruptNext = true
+		server.mu.Unlock()
+
+		if _, err := client.AddPortMapping(ctx, "udp", 4446, time.Hour); err == nil {
+			t.Fatal("create with corrupted response: error = nil, want parse failure")
+		}
+		if !server.hasMapping(ProtoUDP, 4446) {
+			t.Fatal("server did not create the mapping")
+		}
+		if err := client.DeletePortMapping(ctx, "udp", 4446); err != nil {
+			t.Fatalf("delete mapping: %v (must reuse the nonce sent with the failed create)", err)
+		}
+		if server.hasMapping(ProtoUDP, 4446) {
+			t.Fatal("mapping still present on server: pinhole leaks after a lost create response")
+		}
+	})
+
+	t.Run("delete reuses create nonce and removes mapping", func(t *testing.T) {
+		client := newTestClient()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if _, err := client.AddPortMapping(ctx, "udp", 4445, time.Hour); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+		err := client.DeletePortMapping(ctx, "udp", 4445)
+		if server.hasMapping(ProtoUDP, 4445) {
+			if err == nil {
+				t.Fatal("mapping still present on server and DeletePortMapping returned nil: NOT_AUTHORIZED was silently swallowed")
+			}
+			t.Fatalf("mapping still present on server: %v", err)
+		}
+		if err != nil {
+			t.Fatalf("delete mapping: %v", err)
+		}
+	})
+}
 
 func TestSendOnceStopsOnCancel(t *testing.T) {
 	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
