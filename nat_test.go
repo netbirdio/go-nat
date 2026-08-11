@@ -150,6 +150,28 @@ func TestDualStackMappingStartsBothStacks(t *testing.T) {
 	<-done
 }
 
+func TestDualStackMappingRollsBackIPv6OnIPv4Failure(t *testing.T) {
+	ipv4 := &fakeNAT{addErr: errors.New("IPv4 mapping failed")}
+	ipv6 := &fakePCPMapper{}
+	gateway := newNATWithPCPIPv6(ipv4, ipv6)
+
+	if _, err := gateway.AddPortMapping(context.Background(), "tcp", 1234, "test", time.Minute); err == nil {
+		t.Fatal("AddPortMapping() error = nil, want IPv4 failure")
+	}
+	if ipv6.deletes != 1 {
+		t.Fatalf("IPv6 deletes = %d, want 1: the pinhole leaks when the IPv4 mapping fails", ipv6.deletes)
+	}
+}
+
+func TestDualStackDeleteSurfacesIPv6Error(t *testing.T) {
+	v6Err := errors.New("IPv6 delete failed")
+	gateway := newNATWithPCPIPv6(&fakeNAT{}, &fakePCPMapper{addErr: v6Err})
+
+	if err := gateway.DeletePortMapping(context.Background(), "tcp", 1234); !errors.Is(err, v6Err) {
+		t.Fatalf("DeletePortMapping() error = %v, want %v", err, v6Err)
+	}
+}
+
 func TestSelectGatewayUsesFirstFallback(t *testing.T) {
 	first := &fakeNAT{typ: "UPnP"}
 	second := &fakeNAT{typ: "NAT-PMP"}

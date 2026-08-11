@@ -95,10 +95,11 @@ func (n *NAT) AddPortMapping(ctx context.Context, protocol string, internalPort 
 	client6 := n.client6
 
 	var client6Done chan struct{}
+	var err6 error
 	if client6 != nil {
 		client6Done = make(chan struct{})
 		go func() {
-			_, _ = client6.AddPortMapping(ctx, protocol, internalPort, timeout)
+			_, err6 = client6.AddPortMapping(ctx, protocol, internalPort, timeout)
 			close(client6Done)
 		}()
 	}
@@ -108,9 +109,22 @@ func (n *NAT) AddPortMapping(ctx context.Context, protocol string, internalPort 
 		<-client6Done
 	}
 	if err != nil {
+		if err6 == nil && client6 != nil {
+			rollbackPinhole(ctx, client6, protocol, internalPort)
+		}
 		return 0, fmt.Errorf("add mapping: %w", err)
 	}
 	return int(resp.ExternalPort), nil
+}
+
+// rollbackPinhole closes a v6 pinhole opened alongside a failed v4 mapping:
+// the caller sees a failed mapping and will never delete it, so the pinhole
+// would leak until its lifetime expires. Detached from ctx because the v4
+// failure may be the caller's deadline expiring.
+func rollbackPinhole(ctx context.Context, client6 *Client, protocol string, internalPort int) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultTimeout)
+	defer cancel()
+	_ = client6.DeletePortMapping(ctx, protocol, internalPort)
 }
 
 // DeletePortMapping removes a port mapping from both IPv4 and IPv6.
@@ -123,10 +137,11 @@ func (n *NAT) DeletePortMapping(ctx context.Context, protocol string, internalPo
 	}
 
 	var client6Done chan struct{}
+	var err6 error
 	if n.client6 != nil {
 		client6Done = make(chan struct{})
 		go func() {
-			_ = n.client6.DeletePortMapping(ctx, protocol, internalPort)
+			err6 = n.client6.DeletePortMapping(ctx, protocol, internalPort)
 			close(client6Done)
 		}()
 	}
@@ -135,7 +150,10 @@ func (n *NAT) DeletePortMapping(ctx context.Context, protocol string, internalPo
 	if client6Done != nil {
 		<-client6Done
 	}
-	if err != nil {
+	if err6 != nil {
+		err6 = fmt.Errorf("ipv6: %w", err6)
+	}
+	if err := errors.Join(err, err6); err != nil {
 		return fmt.Errorf("delete mapping: %w", err)
 	}
 	return nil
