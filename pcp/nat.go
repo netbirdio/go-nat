@@ -5,10 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"runtime"
 	"time"
-
-	"github.com/libp2p/go-netroute"
 )
 
 var (
@@ -55,21 +52,30 @@ func (n *NAT) Type() string {
 	return "PCP"
 }
 
+// primary returns the IPv4 client when present, falling back to the IPv6
+// client for v6-only discovery.
+func (n *NAT) primary() *Client {
+	if n.client != nil {
+		return n.client
+	}
+	return n.client6
+}
+
 // GetDeviceAddress returns the gateway IP address.
 func (n *NAT) GetDeviceAddress() (net.IP, error) {
-	return n.client.Gateway(), nil
+	return n.primary().Gateway(), nil
 }
 
 // GetExternalAddress returns the external IP address.
 func (n *NAT) GetExternalAddress() (net.IP, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return n.client.GetExternalAddress(ctx)
+	return n.primary().GetExternalAddress(ctx)
 }
 
 // GetInternalAddress returns the local IP address used to communicate with the gateway.
 func (n *NAT) GetInternalAddress() (net.IP, error) {
-	addr, err := n.client.getLocalIP()
+	addr, err := n.primary().getLocalIP()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNoInternalAddress, err)
 	}
@@ -78,6 +84,14 @@ func (n *NAT) GetInternalAddress() (net.IP, error) {
 
 // AddPortMapping creates a port mapping on both IPv4 and IPv6 (if available).
 func (n *NAT) AddPortMapping(ctx context.Context, protocol string, internalPort int, _ string, timeout time.Duration) (int, error) {
+	if n.client == nil {
+		resp, err := n.client6.AddPortMapping(ctx, protocol, internalPort, timeout)
+		if err != nil {
+			return 0, fmt.Errorf("add mapping: %w", err)
+		}
+		return int(resp.ExternalPort), nil
+	}
+
 	client6 := n.client6
 
 	var client6Done chan struct{}
@@ -101,6 +115,13 @@ func (n *NAT) AddPortMapping(ctx context.Context, protocol string, internalPort 
 
 // DeletePortMapping removes a port mapping from both IPv4 and IPv6.
 func (n *NAT) DeletePortMapping(ctx context.Context, protocol string, internalPort int) error {
+	if n.client == nil {
+		if err := n.client6.DeletePortMapping(ctx, protocol, internalPort); err != nil {
+			return fmt.Errorf("delete mapping: %w", err)
+		}
+		return nil
+	}
+
 	var client6Done chan struct{}
 	if n.client6 != nil {
 		client6Done = make(chan struct{})
@@ -123,31 +144,54 @@ func (n *NAT) DeletePortMapping(ctx context.Context, protocol string, internalPo
 // CheckServerHealth sends an ANNOUNCE to verify the server is still responsive.
 // It returns the current epoch and whether the server may have restarted.
 func (n *NAT) CheckServerHealth(ctx context.Context) (epoch uint32, serverRestarted bool, err error) {
-	epoch, err = n.client.Announce(ctx)
+	client := n.primary()
+	epoch, err = client.Announce(ctx)
 	if err != nil {
 		return 0, false, fmt.Errorf("announce: %w", err)
 	}
-	return epoch, n.client.EpochStateLost(), nil
+	return epoch, client.EpochStateLost(), nil
 }
 
-// DiscoverPCP attempts to discover a PCP-capable IPv4 gateway.
-// When available, it also discovers an IPv6 gateway for firewall pinholes.
+// DiscoverPCP attempts to discover PCP-capable IPv4 and IPv6 gateways
+// independently. It fails only when neither is found, so a v6-only network
+// still yields a NAT that can open firewall pinholes.
 func DiscoverPCP(ctx context.Context) (*NAT, error) {
-	result, err := DiscoverPCPIPv4(ctx)
-	if err != nil {
-		return nil, err
-	}
+	return discoverPCP(ctx, &defaultGatewayDiscoverer{})
+}
 
-	client6, err := DiscoverPCPIPv6(ctx)
-	if err == nil {
-		result.client6 = client6
+func discoverPCP(ctx context.Context, gds gatewayDiscoverer) (*NAT, error) {
+	type v6Result struct {
+		client *Client
+		err    error
+	}
+	v6Ch := make(chan v6Result, 1)
+	go func() {
+		client, err := discoverPCPIPv6(ctx, gds)
+		v6Ch <- v6Result{client, err}
+	}()
+
+	result, v4Err := discoverPCPIPv4(ctx, gds)
+	v6 := <-v6Ch
+
+	if v4Err != nil && v6.err != nil {
+		return nil, errors.Join(v4Err, v6.err)
+	}
+	if result == nil {
+		result = &NAT{}
+	}
+	if v6.err == nil {
+		result.client6 = v6.client
 	}
 	return result, nil
 }
 
 // DiscoverPCPIPv4 discovers a PCP-capable IPv4 gateway.
 func DiscoverPCPIPv4(ctx context.Context) (*NAT, error) {
-	gateway, localIP, err := getDefaultGateway()
+	return discoverPCPIPv4(ctx, &defaultGatewayDiscoverer{})
+}
+
+func discoverPCPIPv4(ctx context.Context, gds gatewayDiscoverer) (*NAT, error) {
+	gateway, localIP, err := gds.Discover(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get default gateway: %w", err)
 	}
@@ -161,7 +205,11 @@ func DiscoverPCPIPv4(ctx context.Context) (*NAT, error) {
 
 // DiscoverPCPIPv6 discovers a PCP-capable IPv6 gateway for firewall pinholes.
 func DiscoverPCPIPv6(ctx context.Context) (*Client, error) {
-	gateway, localIP, zone, err := getDefaultGateway6()
+	return discoverPCPIPv6(ctx, &defaultGatewayDiscoverer{})
+}
+
+func discoverPCPIPv6(ctx context.Context, gds gatewayDiscoverer) (*Client, error) {
+	gateway, localIP, zone, err := gds.DiscoverV6(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get default IPv6 gateway: %w", err)
 	}
@@ -179,64 +227,5 @@ func DiscoverPCPIPv6(ctx context.Context) (*Client, error) {
 
 // Discover is an alias for DiscoverPCP.
 func Discover(ctx context.Context) (*NAT, error) {
-	return DiscoverPCP(ctx)
-}
-
-// getDefaultGateway returns the default IPv4 gateway and local IP using the system routing table.
-func getDefaultGateway() (gateway net.IP, localIP net.IP, err error) {
-	router, err := netroute.New()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	dst := net.IPv4zero
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		// go-netroute v0.4.0 rejects unspecified destinations client-side on Linux/Android.
-		// TODO: on android/ios, use platform APIs (ConnectivityManager.getLinkProperties /
-		// NWPathMonitor) when netlink-based lookup is restricted or unavailable.
-		dst = net.IPv4(0, 0, 0, 1)
-	}
-	_, gateway, localIP, err = router.Route(dst)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if gateway == nil {
-		return nil, nil, ErrNoNATFound
-	}
-	if localIP == nil {
-		return nil, nil, ErrNoInternalAddress
-	}
-
-	return gateway, localIP, nil
-}
-
-// getDefaultGateway6 returns the default IPv6 gateway, local IP, and scope zone.
-func getDefaultGateway6() (gateway net.IP, localIP net.IP, zone string, err error) {
-	router, err := netroute.New()
-	if err != nil {
-		return nil, nil, "", err
-	}
-
-	dst := net.IPv6zero
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		// ::2
-		dst = net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
-	}
-	iface, gateway, localIP, err := router.Route(dst)
-	if err != nil {
-		return nil, nil, "", err
-	}
-
-	if gateway == nil {
-		return nil, nil, "", ErrNoNATFound
-	}
-	if localIP == nil {
-		return nil, nil, "", ErrNoInternalAddress
-	}
-	if gateway.IsLinkLocalUnicast() && iface != nil {
-		zone = iface.Name
-	}
-
-	return gateway, localIP, zone, nil
+	return discoverPCP(ctx, &defaultGatewayDiscoverer{})
 }
