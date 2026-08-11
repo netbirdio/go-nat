@@ -165,10 +165,17 @@ func buildMapRequest(clientIP netip.Addr, nonce [12]byte, protocol uint8, intern
 	req[36] = protocol
 	binary.BigEndian.PutUint16(req[40:42], internalPort)
 	binary.BigEndian.PutUint16(req[42:44], suggestedExtPort)
-	if suggestedExtIP.IsValid() {
-		extMapped := addrTo16(suggestedExtIP)
-		copy(req[44:60], extMapped[:])
+	if !suggestedExtIP.IsValid() {
+		// RFC 6887 §11.1: no preference is the address-family all-zeros
+		// address, which for IPv4 is ::ffff:0.0.0.0 (§5), not ::.
+		if clientIP.Is4() {
+			suggestedExtIP = netip.IPv4Unspecified()
+		} else {
+			suggestedExtIP = netip.IPv6Unspecified()
+		}
 	}
+	extMapped := addrTo16(suggestedExtIP)
+	copy(req[44:60], extMapped[:])
 
 	return req
 }
