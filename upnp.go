@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
@@ -20,20 +21,46 @@ import (
 	"github.com/koron/go-ssdp"
 )
 
+const ssdpPort uint16 = 1900
+
 const (
-	ssdpPort      = "1900"
 	searchRepeats = 3
+
+	// defaultHTTPPort is what a UPnP device URL means when it omits the port.
+	defaultHTTPPort = "80"
 )
+
+// upnpDiscovery names how a UPnP device was found. It ends up in the NAT type,
+// which is what callers log.
+type upnpDiscovery string
+
+const (
+	upnpDiscoveryUnicast   upnpDiscovery = "unicast"
+	upnpDiscoveryMulticast upnpDiscovery = "multicast"
+)
+
+// upnpSearchTarget is an SSDP ST header value.
+type upnpSearchTarget string
+
+const (
+	searchTargetIGDv2 upnpSearchTarget = "urn:schemas-upnp-org:device:InternetGatewayDevice:2"
+	searchTargetIGDv1 upnpSearchTarget = "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
+	searchTargetAll   upnpSearchTarget = "ssdp:all"
+)
+
+// errNoDeviceHost is returned when a UPnP device description carries no usable
+// base URL, leaving nothing to address the device by.
+var errNoDeviceHost = errors.New("device description has no host")
 
 // upnpUnicastSearchTimeout is how long each unicast SSDP search waits for
 // responses. It is a variable so tests can shorten it.
 var upnpUnicastSearchTimeout = 2 * time.Second
 
 // upnpUnicastSearchTargets are tried in order until one yields a usable gateway.
-var upnpUnicastSearchTargets = []string{
-	"urn:schemas-upnp-org:device:InternetGatewayDevice:2",
-	"urn:schemas-upnp-org:device:InternetGatewayDevice:1",
-	"ssdp:all",
+var upnpUnicastSearchTargets = []upnpSearchTarget{
+	searchTargetIGDv2,
+	searchTargetIGDv1,
+	searchTargetAll,
 }
 
 // upnpServiceRank orders WAN connection services by preference, matching the
@@ -184,10 +211,14 @@ func discoverUPNP_Unicast(ctx context.Context) <-chan NAT {
 	if err != nil {
 		return nil
 	}
-	return discoverUPNPUnicastWithAddr(ctx, net.JoinHostPort(gateway.String(), ssdpPort))
+	addr, ok := netip.AddrFromSlice(gateway)
+	if !ok {
+		return nil
+	}
+	return discoverUPNPUnicastWithAddr(ctx, netip.AddrPortFrom(addr.Unmap(), ssdpPort))
 }
 
-func discoverUPNPUnicastWithAddr(ctx context.Context, gatewayAddr string) <-chan NAT {
+func discoverUPNPUnicastWithAddr(ctx context.Context, gatewayAddr netip.AddrPort) <-chan NAT {
 	res := make(chan NAT, 1)
 	go func() {
 		defer close(res)
@@ -208,7 +239,7 @@ func discoverUPNPUnicastWithAddr(ctx context.Context, gatewayAddr string) <-chan
 // discoverUPNPUnicast attempts to find a UPnP IGD by sending unicast SSDP
 // searches to gatewayAddr. This is useful on networks where multicast SSDP is
 // filtered but gateways still answer direct M-SEARCH requests.
-func discoverUPNPUnicast(ctx context.Context, gatewayAddr string) (NAT, error) {
+func discoverUPNPUnicast(ctx context.Context, gatewayAddr netip.AddrPort) (NAT, error) {
 	client, err := httpu.NewHTTPUClient()
 	if err != nil {
 		return nil, fmt.Errorf("create SSDP client: %w", err)
@@ -232,7 +263,15 @@ func discoverUPNPUnicast(ctx context.Context, gatewayAddr string) (NAT, error) {
 			}
 			checked[location] = true
 
-			gateway, err := natFromUPNPLocation(ctx, location)
+			// The search was addressed to the gateway, but any host on the
+			// link can answer it. Drop a description URL that names a
+			// different address, so a rogue responder cannot redirect
+			// discovery at a device of its choosing.
+			if !locationCouldBeAddr(location, gatewayAddr.Addr()) {
+				continue
+			}
+
+			gateway, err := natFromUPNPLocation(ctx, location, upnpDiscoveryUnicast)
 			if err == nil {
 				return gateway, nil
 			}
@@ -242,23 +281,40 @@ func discoverUPNPUnicast(ctx context.Context, gatewayAddr string) (NAT, error) {
 	return nil, fmt.Errorf("no UPnP gateway found at %s", gatewayAddr)
 }
 
+// locationCouldBeAddr reports whether an SSDP description URL may belong to the
+// device at addr. A URL naming a different address definitely may not. A URL
+// naming a host rather than an address is accepted, since it cannot be checked
+// without resolving it, which is what fetching it would do anyway.
+func locationCouldBeAddr(location string, addr netip.Addr) bool {
+	loc, err := url.Parse(location)
+	if err != nil {
+		return false
+	}
+	locAddr, err := netip.ParseAddr(loc.Hostname())
+	if err != nil {
+		return true
+	}
+	return locAddr.Unmap() == addr.Unmap()
+}
+
 // searchUPNPUnicast sends a unicast M-SEARCH to gatewayAddr and returns the
 // description URLs of devices that answered.
-func searchUPNPUnicast(client *httpu.HTTPUClient, gatewayAddr, searchTarget string) ([]string, error) {
+func searchUPNPUnicast(client *httpu.HTTPUClient, gatewayAddr netip.AddrPort, searchTarget upnpSearchTarget) ([]string, error) {
 	mx := max(int(upnpUnicastSearchTimeout/time.Second), 1)
+	host := gatewayAddr.String()
 	req := &http.Request{
 		Method: "M-SEARCH",
 		// httpu sends the request to req.Host, making the search unicast.
-		Host: gatewayAddr,
+		Host: host,
 		URL:  &url.URL{Opaque: "*"},
 		// Header keys are set verbatim (map literal keys bypass Go's
 		// canonicalization) to keep the upper-case field names SSDP
 		// implementations expect.
 		Header: http.Header{
-			"HOST": []string{gatewayAddr},
+			"HOST": []string{host},
 			"MAN":  []string{`"ssdp:discover"`},
 			"MX":   []string{strconv.Itoa(mx)},
-			"ST":   []string{searchTarget},
+			"ST":   []string{string(searchTarget)},
 		},
 	}
 
@@ -297,7 +353,7 @@ func discoverUPNP_GenIGDev(ctx context.Context) <-chan NAT {
 				continue
 			}
 
-			gateway, err := natFromUPNPLocation(ctx, service.Location)
+			gateway, err := natFromUPNPLocation(ctx, service.Location, upnpDiscoveryMulticast)
 			if err != nil {
 				continue
 			}
@@ -314,7 +370,7 @@ func discoverUPNP_GenIGDev(ctx context.Context) <-chan NAT {
 
 // natFromUPNPLocation fetches the device description and returns a NAT backed
 // by the most preferred WAN connection service it offers.
-func natFromUPNPLocation(ctx context.Context, location string) (NAT, error) {
+func natFromUPNPLocation(ctx context.Context, location string, discovery upnpDiscovery) (NAT, error) {
 	loc, err := url.Parse(location)
 	if err != nil {
 		return nil, fmt.Errorf("parse location: %w", err)
@@ -336,7 +392,7 @@ func natFromUPNPLocation(ctx context.Context, location string) (NAT, error) {
 	})
 
 	for _, srv := range services {
-		gateway, err := natFromUPNPService(ctx, root, loc, srv)
+		gateway, err := natFromUPNPService(ctx, root, loc, srv, discovery)
 		if err == nil {
 			return gateway, nil
 		}
@@ -345,7 +401,9 @@ func natFromUPNPLocation(ctx context.Context, location string) (NAT, error) {
 	return nil, fmt.Errorf("no usable WAN connection service in device at %s", location)
 }
 
-func natFromUPNPService(ctx context.Context, root *goupnp.RootDevice, loc *url.URL, srv *goupnp.Service) (NAT, error) {
+// natFromUPNPService builds a NAT from one WAN connection service. discovery
+// names how the device was found and ends up in the NAT type.
+func natFromUPNPService(ctx context.Context, root *goupnp.RootDevice, loc *url.URL, srv *goupnp.Service, discovery upnpDiscovery) (NAT, error) {
 	serviceClient := goupnp.ServiceClient{
 		SOAPClient: srv.NewSOAPClient(),
 		RootDevice: root,
@@ -354,17 +412,17 @@ func natFromUPNPService(ctx context.Context, root *goupnp.RootDevice, loc *url.U
 	}
 
 	var client upnp_NAT_Client
-	var natType string
+	var service string
 	switch srv.ServiceType {
 	case internetgateway2.URN_WANIPConnection_2:
 		client = &internetgateway2.WANIPConnection2{ServiceClient: serviceClient}
-		natType = "UPnP unicast (IP2)"
+		service = "IP2"
 	case internetgateway2.URN_WANIPConnection_1:
 		client = &internetgateway2.WANIPConnection1{ServiceClient: serviceClient}
-		natType = "UPnP unicast (IP1)"
+		service = "IP1"
 	case internetgateway2.URN_WANPPPConnection_1:
 		client = &internetgateway2.WANPPPConnection1{ServiceClient: serviceClient}
-		natType = "UPnP unicast (PPP1)"
+		service = "PPP1"
 	default:
 		return nil, fmt.Errorf("unsupported service type %s", srv.ServiceType)
 	}
@@ -377,7 +435,7 @@ func natFromUPNPService(ctx context.Context, root *goupnp.RootDevice, loc *url.U
 		return nil, errors.New("gateway reports NAT disabled")
 	}
 
-	return newUPNPNAT(client, natType, root), nil
+	return newUPNPNAT(client, fmt.Sprintf("UPnP %s (%s)", discovery, service), root), nil
 }
 
 type upnp_NAT_Client interface {
@@ -490,7 +548,12 @@ func (u *upnp_NAT) DeletePortMapping(ctx context.Context, protocol string, inter
 }
 
 func (u *upnp_NAT) GetDeviceAddress() (net.IP, error) {
-	addr, err := net.ResolveUDPAddr("udp4", u.rootDevice.URLBase.Host)
+	host, err := deviceHostPort(u.rootDevice)
+	if err != nil {
+		return nil, err
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", host)
 	if err != nil {
 		return nil, err
 	}
@@ -498,10 +561,22 @@ func (u *upnp_NAT) GetDeviceAddress() (net.IP, error) {
 	return addr.IP, nil
 }
 
+// GetInternalAddress returns the local address the gateway sees us on. It asks
+// the routing table which source address would be used to reach the device,
+// which picks the right one when several interfaces share a subnet with it.
 func (u *upnp_NAT) GetInternalAddress() (net.IP, error) {
-	conn, err := net.Dial("udp4", u.rootDevice.URLBase.Host)
+	host, err := deviceHostPort(u.rootDevice)
 	if err != nil {
 		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "udp", host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve local address for %s: %w", host, err)
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -510,6 +585,23 @@ func (u *upnp_NAT) GetInternalAddress() (net.IP, error) {
 		return nil, ErrNoInternalAddress
 	}
 	return localAddr.IP, nil
+}
+
+// deviceHostPort returns the device's host:port, supplying the HTTP default
+// port when the device's URLBase omits it, as the UPnP Device Architecture
+// allows it to.
+func deviceHostPort(root *goupnp.RootDevice) (string, error) {
+	// Hostname and Port handle the brackets around an IPv6 literal, which
+	// splitting URLBase.Host by hand would not.
+	host := root.URLBase.Hostname()
+	if host == "" {
+		return "", errNoDeviceHost
+	}
+	port := root.URLBase.Port()
+	if port == "" {
+		port = defaultHTTPPort
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 func (n *upnp_NAT) Type() string { return n.typ }
