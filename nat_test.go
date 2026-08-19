@@ -40,10 +40,13 @@ func (n *fakeNAT) DeletePortMapping(context.Context, string, int) error {
 }
 
 type fakePCPMapper struct {
-	addErr     error
-	addStarted chan struct{}
-	adds       int
-	deletes    int
+	addErr      error
+	addStarted  chan struct{}
+	announceErr error
+	epochLost   bool
+	adds        int
+	deletes     int
+	announces   int
 }
 
 func (m *fakePCPMapper) AddPortMapping(context.Context, string, int, time.Duration) (*pcp.MapResponse, error) {
@@ -53,9 +56,30 @@ func (m *fakePCPMapper) AddPortMapping(context.Context, string, int, time.Durati
 	}
 	return nil, m.addErr
 }
+
 func (m *fakePCPMapper) DeletePortMapping(context.Context, string, int) error {
 	m.deletes++
 	return m.addErr
+}
+
+func (m *fakePCPMapper) Announce(context.Context) (uint32, error) {
+	m.announces++
+	return 42, m.announceErr
+}
+
+func (m *fakePCPMapper) EpochStateLost() bool { return m.epochLost }
+
+// fakeHealthCheckedNAT is a fallback NAT that also reports gateway health, the
+// shape a PCPv4 gateway has once it is wrapped for IPv6 pinholes.
+type fakeHealthCheckedNAT struct {
+	fakeNAT
+	epoch     uint32
+	restarted bool
+	healthErr error
+}
+
+func (n *fakeHealthCheckedNAT) CheckServerHealth(context.Context) (uint32, bool, error) {
+	return n.epoch, n.restarted, n.healthErr
 }
 
 func results[T any](values ...T) <-chan T {
@@ -87,7 +111,7 @@ func TestSelectGatewayPrefersPCPv4(t *testing.T) {
 	// collected, with PCP preferred over the fallback.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	got, err := selectGateway(ctx, results[NAT](pcp4), results[pcpPortMapper](), results[NAT](fallback))
+	got, err := selectGateway(ctx, results[NAT](pcp4), results[pcpIPv6Client](), results[NAT](fallback))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +125,7 @@ func TestSelectGatewayAddsPCPv6ToFallback(t *testing.T) {
 	fallback := &fakeNAT{typ: "NAT-PMP", port: 4242, addErr: v4Err}
 	pcp6 := &fakePCPMapper{addErr: errors.New("IPv6 mapping failed")}
 
-	got, err := selectGateway(context.Background(), results[NAT](), results[pcpPortMapper](pcp6), results[NAT](fallback))
+	got, err := selectGateway(context.Background(), results[NAT](), results[pcpIPv6Client](pcp6), results[NAT](fallback))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,12 +181,114 @@ func TestDualStackMappingRollsBackIPv6OnIPv4Failure(t *testing.T) {
 	}
 }
 
-func TestDualStackDeleteSurfacesIPv6Error(t *testing.T) {
-	v6Err := errors.New("IPv6 delete failed")
-	gateway := newNATWithPCPIPv6(&fakeNAT{}, &fakePCPMapper{addErr: v6Err})
+func TestDualStackReportsPinholeOutcome(t *testing.T) {
+	v6Err := errors.New("IPv6 pinhole failed")
+	gateway := newNATWithPCPIPv6(&fakeNAT{port: 4242}, &fakePCPMapper{addErr: v6Err})
 
-	if err := gateway.DeletePortMapping(context.Background(), "tcp", 1234); !errors.Is(err, v6Err) {
-		t.Fatalf("DeletePortMapping() error = %v, want %v", err, v6Err)
+	reporter, ok := gateway.(IPv6PinholeReporter)
+	if !ok {
+		t.Fatal("dual-stack gateway does not implement IPv6PinholeReporter")
+	}
+
+	// A pinhole failure must not fail the call: the peer on the other end may
+	// have no IPv6 at all, so the IPv4 mapping is what matters.
+	port, err := gateway.AddPortMapping(context.Background(), "tcp", 1234, "test", time.Minute)
+	if port != 4242 || err != nil {
+		t.Fatalf("AddPortMapping() = (%d, %v), want (4242, nil)", port, err)
+	}
+	if got := reporter.IPv6PinholeError(); !errors.Is(got, v6Err) {
+		t.Fatalf("IPv6PinholeError() after add = %v, want %v", got, v6Err)
+	}
+
+	if err := gateway.DeletePortMapping(context.Background(), "tcp", 1234); err != nil {
+		t.Fatalf("DeletePortMapping() error = %v, want nil", err)
+	}
+	if got := reporter.IPv6PinholeError(); !errors.Is(got, v6Err) {
+		t.Fatalf("IPv6PinholeError() after delete = %v, want %v", got, v6Err)
+	}
+}
+
+func TestDualStackClearsPinholeErrorOnSuccess(t *testing.T) {
+	gateway := newNATWithPCPIPv6(&fakeNAT{}, &fakePCPMapper{})
+
+	if _, err := gateway.AddPortMapping(context.Background(), "tcp", 1234, "test", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if got := gateway.(IPv6PinholeReporter).IPv6PinholeError(); got != nil {
+		t.Fatalf("IPv6PinholeError() = %v, want nil", got)
+	}
+}
+
+func TestDualStackTypeNamesBothStacks(t *testing.T) {
+	gateway := newNATWithPCPIPv6(&fakeNAT{typ: "UPnP (IG1-IP1)"}, &fakePCPMapper{})
+	if got, want := gateway.Type(), "UPnP (IG1-IP1)+PCPv6"; got != want {
+		t.Fatalf("Type() = %q, want %q", got, want)
+	}
+}
+
+func TestDualStackHealthCheck(t *testing.T) {
+	tests := []struct {
+		name          string
+		ipv4          NAT
+		ipv6          *fakePCPMapper
+		wantRestarted bool
+		wantErr       bool
+	}{
+		{
+			name: "IPv6 restart alone forces a remap",
+			ipv4: &fakeHealthCheckedNAT{epoch: 7},
+			ipv6: &fakePCPMapper{epochLost: true},
+			// The pinhole is gone even though the IPv4 gateway is healthy.
+			wantRestarted: true,
+		},
+		{
+			name:          "IPv4 restart alone forces a remap",
+			ipv4:          &fakeHealthCheckedNAT{epoch: 7, restarted: true},
+			ipv6:          &fakePCPMapper{},
+			wantRestarted: true,
+		},
+		{
+			name: "neither stack restarted",
+			ipv4: &fakeHealthCheckedNAT{epoch: 7},
+			ipv6: &fakePCPMapper{},
+		},
+		{
+			name: "fallback IPv4 cannot report health, IPv6 still can",
+			ipv4: &fakeNAT{typ: "UPnP"},
+			ipv6: &fakePCPMapper{epochLost: true},
+			// A UPnP gateway has no epoch, so the pinhole is the only signal.
+			wantRestarted: true,
+		},
+		{
+			name: "one unreachable stack is not a restart",
+			ipv4: &fakeHealthCheckedNAT{healthErr: errors.New("unreachable")},
+			ipv6: &fakePCPMapper{epochLost: true},
+			// The IPv6 verdict stands; the unreachable IPv4 server says nothing.
+			wantRestarted: true,
+		},
+		{
+			name:    "both stacks unreachable",
+			ipv4:    &fakeHealthCheckedNAT{healthErr: errors.New("unreachable")},
+			ipv6:    &fakePCPMapper{announceErr: errors.New("unreachable")},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gateway, ok := newNATWithPCPIPv6(tt.ipv4, tt.ipv6).(HealthChecker)
+			if !ok {
+				t.Fatal("dual-stack gateway does not implement HealthChecker")
+			}
+
+			_, restarted, err := gateway.CheckServerHealth(context.Background())
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("CheckServerHealth() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if restarted != tt.wantRestarted {
+				t.Fatalf("serverRestarted = %v, want %v", restarted, tt.wantRestarted)
+			}
+		})
 	}
 }
 
@@ -170,7 +296,7 @@ func TestSelectGatewayAbortsOnCancelledContext(t *testing.T) {
 	// Sources that never publish and never close, like discovery probes stuck
 	// on an unresponsive network.
 	stuck4 := make(chan NAT)
-	stuck6 := make(chan pcpPortMapper)
+	stuck6 := make(chan pcpIPv6Client)
 	stuckFallbacks := make(chan NAT)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -196,7 +322,7 @@ func TestSelectGatewayUsesFirstFallback(t *testing.T) {
 	first := &fakeNAT{typ: "UPnP"}
 	second := &fakeNAT{typ: "NAT-PMP"}
 
-	got, err := selectGateway(context.Background(), results[NAT](), results[pcpPortMapper](), results[NAT](first, second))
+	got, err := selectGateway(context.Background(), results[NAT](), results[pcpIPv6Client](), results[NAT](first, second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +330,7 @@ func TestSelectGatewayUsesFirstFallback(t *testing.T) {
 		t.Fatalf("selected %s, want first fallback", got.Type())
 	}
 
-	_, err = selectGateway(context.Background(), results[NAT](), results[pcpPortMapper](), results[NAT]())
+	_, err = selectGateway(context.Background(), results[NAT](), results[pcpIPv6Client](), results[NAT]())
 	if !errors.Is(err, ErrNoNATFound) {
 		t.Fatalf("empty discovery error = %v, want %v", err, ErrNoNATFound)
 	}

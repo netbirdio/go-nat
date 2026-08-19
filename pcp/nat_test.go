@@ -45,9 +45,10 @@ func TestAddPortMappingRollsBackIPv6OnIPv4Failure(t *testing.T) {
 	}
 }
 
-// A failing v6 delete must surface its error, not be silently dropped: the
-// pinhole stays open and the caller needs to see why.
-func TestDeletePortMappingSurfacesIPv6Error(t *testing.T) {
+// A failing v6 pinhole must not fail the call, since the IPv4 mapping the
+// caller asked about is fine, but it must not be silently dropped either: the
+// pinhole stays open and the caller needs to be able to see why.
+func TestDeletePortMappingReportsIPv6Error(t *testing.T) {
 	newFakePCPServer(t, "udp4", "127.0.0.1:5351")
 	server6 := newFakePCPServer(t, "udp6", "[::1]:5351")
 
@@ -65,8 +66,50 @@ func TestDeletePortMappingSurfacesIPv6Error(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := nat.DeletePortMapping(ctx, "tcp", 4321); err == nil {
-		t.Fatal("DeletePortMapping() error = nil, want surfaced v6 NOT_AUTHORIZED")
+	if err := nat.DeletePortMapping(ctx, "tcp", 4321); err != nil {
+		t.Fatalf("DeletePortMapping() error = %v, want nil: an IPv6 pinhole does not fail the call", err)
+	}
+
+	pinholeErr := nat.IPv6PinholeError()
+	if pinholeErr == nil {
+		t.Fatal("IPv6PinholeError() = nil, want the v6 NOT_AUTHORIZED")
+	}
+	var pcpErr *Error
+	if !errors.As(pinholeErr, &pcpErr) || pcpErr.Code != ResultNotAuthorized {
+		t.Fatalf("IPv6PinholeError() = %v, want NOT_AUTHORIZED", pinholeErr)
+	}
+	if !server6.hasMapping(ProtoTCP, 4321) {
+		t.Fatal("fake server dropped a mapping it answered with NOT_AUTHORIZED")
+	}
+}
+
+// A dual-stack health check must announce on both servers, so that an IPv6
+// restart is caught even when the IPv4 gateway is healthy.
+func TestCheckServerHealthAnnouncesBothStacks(t *testing.T) {
+	newFakePCPServer(t, "udp4", "127.0.0.1:5351")
+	newFakePCPServer(t, "udp6", "[::1]:5351")
+
+	client := NewClient(net.ParseIP("127.0.0.1"))
+	client.SetLocalIP(net.ParseIP("127.0.0.1"))
+	client6 := NewClient(net.ParseIP("::1"))
+	client6.SetLocalIP(net.ParseIP("::1"))
+	nat := &NAT{client: client, client6: client6}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	epoch, restarted, err := nat.CheckServerHealth(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epoch == 0 {
+		t.Fatal("CheckServerHealth() epoch = 0, want the IPv4 server's epoch")
+	}
+	if restarted {
+		t.Fatal("CheckServerHealth() reported a restart on a first announce")
+	}
+	if client6.LastEpoch() == 0 {
+		t.Fatal("IPv6 server was never announced to")
 	}
 }
 

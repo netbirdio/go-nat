@@ -4,49 +4,92 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-nat/pcp"
 )
 
-// pcpPortMapper is the part of pcp.Client needed for IPv6 pinholes. The
+// pinholeRollbackTimeout bounds the pinhole cleanup that runs after a failed
+// IPv4 mapping, which deliberately outlives the caller's context.
+const pinholeRollbackTimeout = 3 * time.Second
+
+// errPinholeRolledBack marks a pinhole that was opened and then closed again
+// because the IPv4 mapping it accompanied failed.
+var errPinholeRolledBack = errors.New("rolled back after the IPv4 mapping failed")
+
+// pcpIPv6Client is the part of pcp.Client needed for IPv6 pinholes. The
 // interface keeps dual-stack behavior testable without network access.
-type pcpPortMapper interface {
+type pcpIPv6Client interface {
 	AddPortMapping(context.Context, string, int, time.Duration) (*pcp.MapResponse, error)
 	DeletePortMapping(context.Context, string, int) error
+	Announce(context.Context) (uint32, error)
+	EpochStateLost() bool
 }
 
-// natWithPCPIPv6 adds best-effort PCPv6 pinholes to an IPv4 NAT.
+// natWithPCPIPv6 adds best-effort PCPv6 pinholes to an IPv4 NAT. Pinholes
+// complement the IPv4 mapping rather than replace it, because a peer reaching
+// this host may have no IPv6 connectivity at all, so a pinhole failure never
+// fails the call. Read IPv6PinholeError to find out what happened.
 type natWithPCPIPv6 struct {
 	NAT
-	pcp6 pcpPortMapper
+	pcp6 pcpIPv6Client
+
+	mu         sync.Mutex
+	pinholeErr error
 }
 
-var _ NAT = (*natWithPCPIPv6)(nil)
+var (
+	_ NAT                 = (*natWithPCPIPv6)(nil)
+	_ HealthChecker       = (*natWithPCPIPv6)(nil)
+	_ IPv6PinholeReporter = (*natWithPCPIPv6)(nil)
+)
 
-func newNATWithPCPIPv6(ipv4 NAT, pcp6 pcpPortMapper) NAT {
+func newNATWithPCPIPv6(ipv4 NAT, pcp6 pcpIPv6Client) NAT {
 	return &natWithPCPIPv6{NAT: ipv4, pcp6: pcp6}
+}
+
+// Type reports the IPv4 protocol with a PCPv6 suffix, so that a caller logging
+// the gateway type can tell whether IPv6 pinholes are in play.
+func (n *natWithPCPIPv6) Type() string {
+	return n.NAT.Type() + "+PCPv6"
+}
+
+func (n *natWithPCPIPv6) IPv6PinholeError() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.pinholeErr
+}
+
+func (n *natWithPCPIPv6) setIPv6PinholeError(err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.pinholeErr = err
 }
 
 func (n *natWithPCPIPv6) AddPortMapping(ctx context.Context, protocol string, internalPort int, description string, timeout time.Duration) (int, error) {
 	pcp6Done := make(chan struct{})
 	var pcp6Err error
 	go func() {
+		defer close(pcp6Done)
 		_, pcp6Err = n.pcp6.AddPortMapping(ctx, protocol, internalPort, timeout)
-		close(pcp6Done)
 	}()
 
 	port, err := n.NAT.AddPortMapping(ctx, protocol, internalPort, description, timeout)
 	<-pcp6Done
+
 	if err != nil && pcp6Err == nil {
 		// The caller sees a failed mapping and will never delete it, so close
-		// the v6 pinhole rather than leaking it until its lifetime expires.
-		// Detached from ctx because the v4 failure may be the caller's
+		// the pinhole rather than leaking it until its lifetime expires.
+		// Detached from ctx because the IPv4 failure may be the caller's
 		// deadline expiring.
-		delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pinholeRollbackTimeout)
 		defer cancel()
-		_ = n.pcp6.DeletePortMapping(delCtx, protocol, internalPort)
+		_ = n.pcp6.DeletePortMapping(closeCtx, protocol, internalPort)
+		pcp6Err = errPinholeRolledBack
 	}
+
+	n.setIPv6PinholeError(wrapPinholeErr(pcp6Err))
 	return port, err
 }
 
@@ -54,14 +97,47 @@ func (n *natWithPCPIPv6) DeletePortMapping(ctx context.Context, protocol string,
 	pcp6Done := make(chan struct{})
 	var pcp6Err error
 	go func() {
+		defer close(pcp6Done)
 		pcp6Err = n.pcp6.DeletePortMapping(ctx, protocol, internalPort)
-		close(pcp6Done)
 	}()
 
 	err := n.NAT.DeletePortMapping(ctx, protocol, internalPort)
 	<-pcp6Done
-	if pcp6Err != nil {
-		pcp6Err = fmt.Errorf("pcp ipv6: %w", pcp6Err)
+
+	n.setIPv6PinholeError(wrapPinholeErr(pcp6Err))
+	return err
+}
+
+// CheckServerHealth reports the IPv4 gateway's epoch and whether either stack
+// lost mapping state, since a PCPv6 server restart drops the pinhole even when
+// the IPv4 gateway is healthy. An error is returned only when neither stack
+// could be reached: one unreachable server is not evidence that it restarted,
+// and reporting a restart would recreate a mapping that is very likely fine.
+func (n *natWithPCPIPv6) CheckServerHealth(ctx context.Context) (uint32, bool, error) {
+	epoch6, err6 := n.pcp6.Announce(ctx)
+	restarted6 := err6 == nil && n.pcp6.EpochStateLost()
+
+	checker, ok := n.NAT.(HealthChecker)
+	if !ok {
+		if err6 != nil {
+			return 0, false, wrapPinholeErr(err6)
+		}
+		return epoch6, restarted6, nil
 	}
-	return errors.Join(err, pcp6Err)
+
+	epoch, restarted, err := checker.CheckServerHealth(ctx)
+	switch {
+	case err != nil && err6 != nil:
+		return 0, false, fmt.Errorf("%w; %w", err, wrapPinholeErr(err6))
+	case err != nil:
+		return epoch6, restarted6, nil
+	}
+	return epoch, restarted || restarted6, nil
+}
+
+func wrapPinholeErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("pcp ipv6: %w", err)
 }

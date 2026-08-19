@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -13,6 +14,10 @@ var (
 	ErrNoNATFound = errors.New("no NAT found")
 	// ErrNoInternalAddress is returned when the local address for the gateway is unavailable.
 	ErrNoInternalAddress = errors.New("no internal address")
+
+	// errPinholeRolledBack marks a pinhole that was opened and then closed
+	// again because the IPv4 mapping it accompanied failed.
+	errPinholeRolledBack = errors.New("rolled back after the IPv4 mapping failed")
 )
 
 type natInterface interface {
@@ -36,6 +41,9 @@ var _ natInterface = (*NAT)(nil)
 type NAT struct {
 	client  *Client
 	client6 *Client
+
+	mu         sync.Mutex
+	pinholeErr error
 }
 
 // NewNAT creates a new NAT instance backed by PCP.
@@ -82,10 +90,33 @@ func (n *NAT) GetInternalAddress() (net.IP, error) {
 	return append(net.IP(nil), addr.AsSlice()...), nil
 }
 
-// AddPortMapping creates a port mapping on both IPv4 and IPv6 (if available).
+// IPv6PinholeError returns the error from the most recent IPv6 pinhole
+// operation, or nil when it succeeded. Pinholes are best effort and never fail
+// AddPortMapping or DeletePortMapping on their own, so this is the only way to
+// find out whether one was actually opened.
+func (n *NAT) IPv6PinholeError() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.pinholeErr
+}
+
+func (n *NAT) setPinholeErr(err error) {
+	if err != nil {
+		err = fmt.Errorf("pcp ipv6: %w", err)
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.pinholeErr = err
+}
+
+// AddPortMapping creates a port mapping on IPv4 and, when an IPv6 gateway was
+// also discovered, a firewall pinhole on IPv6. The pinhole complements the
+// IPv4 mapping rather than replacing it, because a peer reaching this host may
+// have no IPv6 connectivity at all, so its failure does not fail the call.
 func (n *NAT) AddPortMapping(ctx context.Context, protocol string, internalPort int, _ string, timeout time.Duration) (int, error) {
 	if n.client == nil {
 		resp, err := n.client6.AddPortMapping(ctx, protocol, internalPort, timeout)
+		n.setPinholeErr(err)
 		if err != nil {
 			return 0, fmt.Errorf("add mapping: %w", err)
 		}
@@ -99,8 +130,8 @@ func (n *NAT) AddPortMapping(ctx context.Context, protocol string, internalPort 
 	if client6 != nil {
 		client6Done = make(chan struct{})
 		go func() {
+			defer close(client6Done)
 			_, err6 = client6.AddPortMapping(ctx, protocol, internalPort, timeout)
-			close(client6Done)
 		}()
 	}
 
@@ -111,26 +142,35 @@ func (n *NAT) AddPortMapping(ctx context.Context, protocol string, internalPort 
 	if err != nil {
 		if err6 == nil && client6 != nil {
 			rollbackPinhole(ctx, client6, protocol, internalPort)
+			err6 = errPinholeRolledBack
 		}
+		n.setPinholeErr(err6)
 		return 0, fmt.Errorf("add mapping: %w", err)
 	}
+
+	n.setPinholeErr(err6)
 	return int(resp.ExternalPort), nil
 }
 
-// rollbackPinhole closes a v6 pinhole opened alongside a failed v4 mapping:
-// the caller sees a failed mapping and will never delete it, so the pinhole
-// would leak until its lifetime expires. Detached from ctx because the v4
-// failure may be the caller's deadline expiring.
+// rollbackPinhole closes an IPv6 pinhole opened alongside a failed IPv4
+// mapping: the caller sees a failed mapping and will never delete it, so the
+// pinhole would leak until its lifetime expires. Detached from ctx because the
+// IPv4 failure may be the caller's deadline expiring.
 func rollbackPinhole(ctx context.Context, client6 *Client, protocol string, internalPort int) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultTimeout)
 	defer cancel()
 	_ = client6.DeletePortMapping(ctx, protocol, internalPort)
 }
 
-// DeletePortMapping removes a port mapping from both IPv4 and IPv6.
+// DeletePortMapping removes the IPv4 mapping and, when present, the IPv6
+// pinhole. As with AddPortMapping, a pinhole failure is reported through
+// IPv6PinholeError rather than failing the call: the IPv4 mapping the caller
+// asked about is gone either way, and the pinhole expires on its own.
 func (n *NAT) DeletePortMapping(ctx context.Context, protocol string, internalPort int) error {
 	if n.client == nil {
-		if err := n.client6.DeletePortMapping(ctx, protocol, internalPort); err != nil {
+		err := n.client6.DeletePortMapping(ctx, protocol, internalPort)
+		n.setPinholeErr(err)
+		if err != nil {
 			return fmt.Errorf("delete mapping: %w", err)
 		}
 		return nil
@@ -141,8 +181,8 @@ func (n *NAT) DeletePortMapping(ctx context.Context, protocol string, internalPo
 	if n.client6 != nil {
 		client6Done = make(chan struct{})
 		go func() {
+			defer close(client6Done)
 			err6 = n.client6.DeletePortMapping(ctx, protocol, internalPort)
-			close(client6Done)
 		}()
 	}
 
@@ -150,24 +190,42 @@ func (n *NAT) DeletePortMapping(ctx context.Context, protocol string, internalPo
 	if client6Done != nil {
 		<-client6Done
 	}
-	if err6 != nil {
-		err6 = fmt.Errorf("ipv6: %w", err6)
-	}
-	if err := errors.Join(err, err6); err != nil {
+
+	n.setPinholeErr(err6)
+	if err != nil {
 		return fmt.Errorf("delete mapping: %w", err)
 	}
 	return nil
 }
 
-// CheckServerHealth sends an ANNOUNCE to verify the server is still responsive.
-// It returns the current epoch and whether the server may have restarted.
+// CheckServerHealth sends an ANNOUNCE to verify the servers are still
+// responsive. It reports the primary server's epoch and whether either stack
+// lost state, since an IPv6 restart drops the pinhole even when IPv4 is
+// healthy. An error is returned only when neither stack could be reached: one
+// unreachable server is not evidence that it restarted, and reporting a
+// restart would recreate a mapping that is very likely fine.
 func (n *NAT) CheckServerHealth(ctx context.Context) (epoch uint32, serverRestarted bool, err error) {
 	client := n.primary()
 	epoch, err = client.Announce(ctx)
-	if err != nil {
-		return 0, false, fmt.Errorf("announce: %w", err)
+	restarted := err == nil && client.EpochStateLost()
+
+	if n.client6 == nil || n.client6 == client {
+		if err != nil {
+			return 0, false, fmt.Errorf("announce: %w", err)
+		}
+		return epoch, restarted, nil
 	}
-	return epoch, client.EpochStateLost(), nil
+
+	epoch6, err6 := n.client6.Announce(ctx)
+	restarted6 := err6 == nil && n.client6.EpochStateLost()
+
+	switch {
+	case err != nil && err6 != nil:
+		return 0, false, fmt.Errorf("announce: %w; pcp ipv6: %w", err, err6)
+	case err != nil:
+		return epoch6, restarted6, nil
+	}
+	return epoch, restarted || restarted6, nil
 }
 
 // DiscoverPCP attempts to discover PCP-capable IPv4 and IPv6 gateways

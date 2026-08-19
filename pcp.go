@@ -32,8 +32,8 @@ func discoverPCPv4(ctx context.Context) <-chan NAT {
 	return results
 }
 
-func discoverPCPv6(ctx context.Context) <-chan pcpPortMapper {
-	results := make(chan pcpPortMapper, 1)
+func discoverPCPv6(ctx context.Context) <-chan pcpIPv6Client {
+	results := make(chan pcpIPv6Client, 1)
 	go func() {
 		defer close(results)
 
