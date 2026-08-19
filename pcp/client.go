@@ -223,6 +223,14 @@ func (c *Client) addPortMappingWithHint(ctx context.Context, protocol string, in
 // DeletePortMapping removes a port mapping by requesting zero lifetime.
 // Deleting a nonexistent mapping succeeds (RFC 6887 §15.1), so any error is
 // a real failure and is returned.
+//
+// This only deletes mappings that this Client created. RFC 6887 §11.3 matches a
+// MAP request to an existing mapping by nonce, and the nonces live in memory,
+// so a mapping created by an earlier process cannot be deleted: the server sees
+// an unknown nonce and treats the request as a no-op on a mapping that does not
+// exist. Such a mapping expires on its own once its lifetime runs out. A caller
+// that needs to clean up after a crash has to persist the nonce alongside the
+// port and restore it before calling this.
 func (c *Client) DeletePortMapping(ctx context.Context, protocol string, internalPort int) error {
 	if _, err := c.addPortMappingWithHint(ctx, protocol, internalPort, 0, netip.Addr{}, 0); err != nil {
 		return fmt.Errorf("delete mapping: %w", err)

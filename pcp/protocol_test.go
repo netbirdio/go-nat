@@ -2,8 +2,10 @@ package pcp
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -205,6 +207,118 @@ func TestParseMapResponseWireFormat(t *testing.T) {
 			}
 			if *got != tt.want {
 				t.Errorf("parseMapResponse() = %+v, want %+v", *got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAddrRoundTrip(t *testing.T) {
+	tests := []string{"192.168.1.100", "127.0.0.1", "2001:db8::1", "::1"}
+	for _, addr := range tests {
+		t.Run(addr, func(t *testing.T) {
+			want := netip.MustParseAddr(addr)
+			if got := addrFrom16(addrTo16(want)); got != want {
+				t.Fatalf("round trip = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestBuildAnnounceRequestWireFormat(t *testing.T) {
+	req := buildAnnounceRequest(netip.MustParseAddr("192.168.1.100"))
+
+	if len(req) != headerSize {
+		t.Fatalf("length = %d, want %d", len(req), headerSize)
+	}
+	if req[0] != Version {
+		t.Errorf("version = %d, want %d", req[0], Version)
+	}
+	if req[1] != OpAnnounce {
+		t.Errorf("opcode = %d, want %d", req[1], OpAnnounce)
+	}
+	// RFC 6887 §5: the client address is carried as an IPv4-mapped IPv6 address.
+	want := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 100}
+	if !bytes.Equal(req[8:24], want) {
+		t.Errorf("client address = % x, want % x", req[8:24], want)
+	}
+}
+
+func TestParseResponseRejectsMalformed(t *testing.T) {
+	valid := func() []byte {
+		resp := make([]byte, headerSize)
+		resp[0] = Version
+		resp[1] = OpAnnounce | OpReply
+		binary.BigEndian.PutUint32(resp[8:12], 12345)
+		return resp
+	}
+
+	t.Run("valid", func(t *testing.T) {
+		parsed, err := parseResponse(valid())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if parsed.ResultCode != ResultSuccess {
+			t.Errorf("result code = %d, want %d", parsed.ResultCode, ResultSuccess)
+		}
+		if parsed.Epoch != 12345 {
+			t.Errorf("epoch = %d, want 12345", parsed.Epoch)
+		}
+	})
+
+	tests := []struct {
+		name string
+		resp []byte
+	}{
+		{name: "too short", resp: []byte{1, 2, 3}},
+		{name: "unsupported version", resp: func() []byte { r := valid(); r[0] = Version + 1; return r }()},
+		{name: "request, not a reply", resp: func() []byte { r := valid(); r[1] = OpAnnounce; return r }()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := parseResponse(tt.resp); err == nil {
+				t.Fatal("parseResponse() error = nil, want a rejection")
+			}
+		})
+	}
+}
+
+func TestResultCodeString(t *testing.T) {
+	tests := map[uint8]string{
+		ResultSuccess:         "SUCCESS",
+		ResultNotAuthorized:   "NOT_AUTHORIZED",
+		ResultAddressMismatch: "ADDRESS_MISMATCH",
+	}
+	for code, want := range tests {
+		if got := ResultCodeString(code); got != want {
+			t.Errorf("ResultCodeString(%d) = %q, want %q", code, got, want)
+		}
+	}
+	if got := ResultCodeString(255); !strings.Contains(got, "UNKNOWN") {
+		t.Errorf("ResultCodeString(255) = %q, want it to mention UNKNOWN", got)
+	}
+}
+
+func TestProtocolNumber(t *testing.T) {
+	tests := []struct {
+		protocol string
+		want     uint8
+		wantErr  bool
+	}{
+		{protocol: "udp", want: ProtoUDP},
+		{protocol: "UDP", want: ProtoUDP},
+		{protocol: "tcp", want: ProtoTCP},
+		{protocol: "TCP", want: ProtoTCP},
+		{protocol: "icmp", wantErr: true},
+		{protocol: "", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.protocol, func(t *testing.T) {
+			got, err := protocolNumber(tt.protocol)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("protocolNumber(%q) error = %v, wantErr %v", tt.protocol, err, tt.wantErr)
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Fatalf("protocolNumber(%q) = %d, want %d", tt.protocol, got, tt.want)
 			}
 		})
 	}
