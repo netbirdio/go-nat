@@ -26,14 +26,7 @@ func (d *defaultGatewayDiscoverer) Discover(ctx context.Context) (gateway net.IP
 		return nil, nil, err
 	}
 
-	dst := net.IPv4zero
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		// go-netroute v0.4.0 rejects unspecified destinations client-side on Linux/Android.
-		// TODO: on android/ios, use platform APIs (ConnectivityManager.getLinkProperties /
-		// NWPathMonitor) when netlink-based lookup is restricted or unavailable.
-		dst = net.IPv4(0, 0, 0, 1)
-	}
-	_, gateway, localIP, err = router.Route(dst)
+	_, gateway, localIP, err = router.Route(defaultRouteProbe4())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -55,12 +48,7 @@ func (d *defaultGatewayDiscoverer) DiscoverV6(ctx context.Context) (gateway net.
 		return nil, nil, "", err
 	}
 
-	dst := net.IPv6zero
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		// ::2
-		dst = net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
-	}
-	iface, gateway, localIP, err := router.Route(dst)
+	iface, gateway, localIP, err := router.Route(defaultRouteProbe6())
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -76,4 +64,34 @@ func (d *defaultGatewayDiscoverer) DiscoverV6(ctx context.Context) (gateway net.
 	}
 
 	return gateway, localIP, zone, nil
+}
+
+// defaultRouteProbe4 returns the destination to look up when asking for the
+// default IPv4 route.
+//
+// On Linux and Android it is a concrete address rather than 0.0.0.0, because
+// go-netroute's netlink implementation rejects an unspecified destination
+// before it reaches the kernel. That implementation is newer than the version
+// this module requires, so both must work: 0.0.0.0/8 is reserved and carries no
+// route of its own, so 0.0.0.1 resolves to the default route on the older
+// table-parsing implementation as well.
+//
+// TODO: on Android and iOS, use the platform APIs
+// (ConnectivityManager.getLinkProperties / NWPathMonitor) when a netlink-based
+// lookup is restricted or unavailable.
+func defaultRouteProbe4() net.IP {
+	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+		return net.IPv4(0, 0, 0, 1)
+	}
+	return net.IPv4zero
+}
+
+// defaultRouteProbe6 is the IPv6 counterpart of defaultRouteProbe4. ::2 sits in
+// the reserved range around the unspecified address and carries no route of its
+// own, so it resolves to the default route.
+func defaultRouteProbe6() net.IP {
+	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+		return net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
+	}
+	return net.IPv6zero
 }
