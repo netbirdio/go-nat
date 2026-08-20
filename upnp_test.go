@@ -9,7 +9,7 @@ import (
 	"github.com/huin/goupnp"
 )
 
-func TestLocationCouldBeAddr(t *testing.T) {
+func TestLocationHasAddr(t *testing.T) {
 	gateway := netip.MustParseAddr("192.168.1.1")
 
 	tests := []struct {
@@ -37,10 +37,10 @@ func TestLocationCouldBeAddr(t *testing.T) {
 			location: "http://203.0.113.7/rootDesc.xml",
 		},
 		{
-			name: "a hostname cannot be checked without resolving it",
-			// Fetching the URL resolves it anyway, so accept it.
+			name: "a host name cannot be checked without resolving it",
+			// A responder free to choose the name is also choosing what the
+			// resolver returns, so the name proves nothing.
 			location: "http://gateway.local:5000/rootDesc.xml",
-			want:     true,
 		},
 		{
 			name:     "unparseable",
@@ -50,17 +50,17 @@ func TestLocationCouldBeAddr(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := locationCouldBeAddr(tt.location, gateway); got != tt.want {
-				t.Fatalf("locationCouldBeAddr(%q) = %v, want %v", tt.location, got, tt.want)
+			if got := locationHasAddr(tt.location, gateway); got != tt.want {
+				t.Fatalf("locationHasAddr(%q) = %v, want %v", tt.location, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestLocationCouldBeAddrMatchesMappedGateway(t *testing.T) {
+func TestLocationHasAddrMatchesMappedGateway(t *testing.T) {
 	// A gateway parsed from a net.IP may arrive as a v4-mapped v6 address.
 	mapped := netip.MustParseAddr("::ffff:192.168.1.1")
-	if !locationCouldBeAddr("http://192.168.1.1:5000/rootDesc.xml", mapped) {
+	if !locationHasAddr("http://192.168.1.1:5000/rootDesc.xml", mapped) {
 		t.Fatal("a v4-mapped gateway did not match its own address")
 	}
 }

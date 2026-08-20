@@ -264,10 +264,10 @@ func discoverUPNPUnicast(ctx context.Context, gatewayAddr netip.AddrPort) (NAT, 
 			checked[location] = true
 
 			// The search was addressed to the gateway, but any host on the
-			// link can answer it. Drop a description URL that names a
-			// different address, so a rogue responder cannot redirect
+			// link can answer it. Only follow a description URL that names
+			// the gateway itself, so a rogue responder cannot redirect
 			// discovery at a device of its choosing.
-			if !locationCouldBeAddr(location, gatewayAddr.Addr()) {
+			if !locationHasAddr(location, gatewayAddr.Addr()) {
 				continue
 			}
 
@@ -281,18 +281,20 @@ func discoverUPNPUnicast(ctx context.Context, gatewayAddr netip.AddrPort) (NAT, 
 	return nil, fmt.Errorf("no UPnP gateway found at %s", gatewayAddr)
 }
 
-// locationCouldBeAddr reports whether an SSDP description URL may belong to the
-// device at addr. A URL naming a different address definitely may not. A URL
-// naming a host rather than an address is accepted, since it cannot be checked
-// without resolving it, which is what fetching it would do anyway.
-func locationCouldBeAddr(location string, addr netip.Addr) bool {
+// locationHasAddr reports whether an SSDP description URL names the device at
+// addr. A URL carrying a host name rather than an address is rejected: it
+// cannot be checked without resolving it, and a responder free to choose the
+// name would then also be choosing what the resolver returns. Gateways
+// advertise themselves by address, since a client on the link has no way to
+// resolve a name they might publish instead.
+func locationHasAddr(location string, addr netip.Addr) bool {
 	loc, err := url.Parse(location)
 	if err != nil {
 		return false
 	}
 	locAddr, err := netip.ParseAddr(loc.Hostname())
 	if err != nil {
-		return true
+		return false
 	}
 	return locAddr.Unmap() == addr.Unmap()
 }
