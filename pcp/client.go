@@ -162,14 +162,18 @@ func (c *Client) addPortMappingWithHint(ctx context.Context, protocol string, in
 		}
 	}
 
+	// Generate a candidate before taking the lock, which also guards the epoch
+	// and the cached external IP: an entropy read should not block them.
+	var fresh [12]byte
+	if _, err := rand.Read(fresh[:]); err != nil {
+		return nil, fmt.Errorf("generate nonce: %w", err)
+	}
+
 	key := mappingKey{proto: proto, port: uint16(internalPort)}
 	c.mu.Lock()
 	nonce, haveNonce := c.nonces[key]
 	if !haveNonce {
-		if _, err := rand.Read(nonce[:]); err != nil {
-			c.mu.Unlock()
-			return nil, fmt.Errorf("generate nonce: %w", err)
-		}
+		nonce = fresh
 	}
 	// Store the nonce before sending: if the server creates the mapping but
 	// the response is lost, a later delete must still present this nonce or

@@ -77,8 +77,9 @@ func TestDiscover(t *testing.T) {
 	}
 }
 
-// go-netroute v0.4.0 rejects unspecified destinations client-side on
-// Linux/Android, so Discover must not pass 0.0.0.0 / :: there.
+// go-netroute's netlink lookup rejects an unspecified destination before it
+// reaches the kernel, so Discover must not pass 0.0.0.0 or :: on Linux and
+// Android. See defaultRouteProbe4.
 func TestDiscoverLinuxDst(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-specific destination workaround")
@@ -111,11 +112,12 @@ func TestDiscoverV6(t *testing.T) {
 		name     string
 		router   *fakeRouter
 		newErr   error
-		wantErr  error
+		wantErr  error // nil means success; errors.New sentinels checked by identity
+		anyErr   bool  // just expect some error
 		wantZone string
 	}{
-		{name: "netroute init error", newErr: errors.New("no netlink"), wantErr: errors.New("")},
-		{name: "route error", router: &fakeRouter{err: errors.New("no route")}, wantErr: errors.New("")},
+		{name: "netroute init error", newErr: errors.New("no netlink"), anyErr: true},
+		{name: "route error", router: &fakeRouter{err: errors.New("no route")}, anyErr: true},
 		{name: "nil gateway", router: &fakeRouter{src: local}, wantErr: ErrNoNATFound},
 		{name: "nil local IP", router: &fakeRouter{gateway: net.ParseIP("fe80::1")}, wantErr: ErrNoInternalAddress},
 		{name: "global gateway has no zone", router: &fakeRouter{gateway: net.ParseIP("2001:db8::1"), src: local, iface: eth0}},
@@ -129,11 +131,11 @@ func TestDiscoverV6(t *testing.T) {
 
 			gateway, localIP, zone, err := (&defaultGatewayDiscoverer{}).DiscoverV6(context.Background())
 
-			if tt.wantErr != nil {
+			if tt.anyErr || tt.wantErr != nil {
 				if err == nil {
 					t.Fatal("DiscoverV6() error = nil, want error")
 				}
-				if tt.wantErr.Error() != "" && !errors.Is(err, tt.wantErr) {
+				if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
 					t.Fatalf("DiscoverV6() error = %v, want %v", err, tt.wantErr)
 				}
 				return

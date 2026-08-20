@@ -21,6 +21,12 @@ var newRouter = netroute.New
 
 // Discover returns the default IPv4 gateway and local IP using the system routing table.
 func (d *defaultGatewayDiscoverer) Discover(ctx context.Context) (gateway net.IP, localIP net.IP, err error) {
+	// router.Route is a synchronous system call that cannot observe
+	// cancellation, so this is the only point where ctx is honored.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
 	router, err := newRouter()
 	if err != nil {
 		return nil, nil, err
@@ -43,6 +49,12 @@ func (d *defaultGatewayDiscoverer) Discover(ctx context.Context) (gateway net.IP
 
 // DiscoverV6 returns the default IPv6 gateway, local IP, and scope zone.
 func (d *defaultGatewayDiscoverer) DiscoverV6(ctx context.Context) (gateway net.IP, localIP net.IP, zone string, err error) {
+	// router.Route is a synchronous system call that cannot observe
+	// cancellation, so this is the only point where ctx is honored.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, "", err
+	}
+
 	router, err := newRouter()
 	if err != nil {
 		return nil, nil, "", err

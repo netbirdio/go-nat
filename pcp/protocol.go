@@ -168,7 +168,7 @@ func buildMapRequest(clientIP netip.Addr, nonce [12]byte, protocol uint8, intern
 	if !suggestedExtIP.IsValid() {
 		// RFC 6887 §11.1: no preference is the address-family all-zeros
 		// address, which for IPv4 is ::ffff:0.0.0.0 (§5), not ::.
-		if clientIP.Is4() {
+		if clientIP.Is4() || clientIP.Is4In6() {
 			suggestedExtIP = netip.IPv4Unspecified()
 		} else {
 			suggestedExtIP = netip.IPv6Unspecified()

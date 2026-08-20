@@ -212,6 +212,34 @@ func TestParseMapResponseWireFormat(t *testing.T) {
 	}
 }
 
+func TestParseMapResponseRejectsMalformed(t *testing.T) {
+	valid := func() []byte {
+		resp := make([]byte, mapRequestSize)
+		resp[0] = Version
+		resp[1] = OpMap | OpReply
+		return resp
+	}
+
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "empty", data: nil},
+		{name: "header only", data: valid()[:headerSize]},
+		{name: "one byte short", data: valid()[:mapRequestSize-1]},
+		{name: "unsupported version", data: func() []byte { r := valid(); r[0] = Version + 1; return r }()},
+		{name: "request, not a reply", data: func() []byte { r := valid(); r[1] = OpMap; return r }()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := parseMapResponse(tt.data); err == nil {
+				t.Fatal("parseMapResponse() error = nil, want a rejection")
+			}
+		})
+	}
+}
+
 func TestAddrRoundTrip(t *testing.T) {
 	tests := []string{"192.168.1.100", "127.0.0.1", "2001:db8::1", "::1"}
 	for _, addr := range tests {
