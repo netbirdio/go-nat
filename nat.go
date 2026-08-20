@@ -4,6 +4,7 @@ package nat
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"net"
@@ -168,7 +169,13 @@ func selectGateway(ctx context.Context, pcp4s <-chan NAT, pcp6s <-chan pcpIPv6Cl
 		}
 	}
 
-	return found.gateway()
+	gateway, err := found.gateway()
+	if err != nil && ctx.Err() != nil {
+		// Nothing was found, but the deadline also passed, so the caller can
+		// tell "this network has no NAT" from "the probes ran out of time".
+		return nil, fmt.Errorf("%w: %w", err, ctx.Err())
+	}
+	return gateway, err
 }
 
 // gatewaySelection accumulates discovery results while selectGateway waits.
