@@ -41,6 +41,7 @@ func (n *fakeNAT) DeletePortMapping(context.Context, string, int) error {
 
 type fakePCPMapper struct {
 	addErr      error
+	deleteErr   error
 	addStarted  chan struct{}
 	announceErr error
 	epochLost   bool
@@ -59,7 +60,7 @@ func (m *fakePCPMapper) AddPortMapping(context.Context, string, int, time.Durati
 
 func (m *fakePCPMapper) DeletePortMapping(context.Context, string, int) error {
 	m.deletes++
-	return m.addErr
+	return m.deleteErr
 }
 
 func (m *fakePCPMapper) Announce(context.Context) (uint32, error) {
@@ -183,7 +184,7 @@ func TestDualStackMappingRollsBackIPv6OnIPv4Failure(t *testing.T) {
 
 func TestDualStackReportsPinholeOutcome(t *testing.T) {
 	v6Err := errors.New("IPv6 pinhole failed")
-	gateway := newNATWithPCPIPv6(&fakeNAT{port: 4242}, &fakePCPMapper{addErr: v6Err})
+	gateway := newNATWithPCPIPv6(&fakeNAT{port: 4242}, &fakePCPMapper{addErr: v6Err, deleteErr: v6Err})
 
 	reporter, ok := gateway.(IPv6PinholeReporter)
 	if !ok {
@@ -209,13 +210,61 @@ func TestDualStackReportsPinholeOutcome(t *testing.T) {
 }
 
 func TestDualStackClearsPinholeErrorOnSuccess(t *testing.T) {
-	gateway := newNATWithPCPIPv6(&fakeNAT{}, &fakePCPMapper{})
+	mapper := &fakePCPMapper{addErr: errors.New("IPv6 pinhole failed")}
+	gateway := newNATWithPCPIPv6(&fakeNAT{}, mapper)
+	reporter := gateway.(IPv6PinholeReporter)
+
+	// Fail a pinhole first, so the nil below shows the error was cleared
+	// rather than never recorded.
+	if _, err := gateway.AddPortMapping(context.Background(), "tcp", 1234, "test", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if reporter.IPv6PinholeError() == nil {
+		t.Fatal("IPv6PinholeError() = nil, want the pinhole failure")
+	}
+
+	mapper.addErr = nil
 
 	if _, err := gateway.AddPortMapping(context.Background(), "tcp", 1234, "test", time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if got := gateway.(IPv6PinholeReporter).IPv6PinholeError(); got != nil {
+	if got := reporter.IPv6PinholeError(); got != nil {
 		t.Fatalf("IPv6PinholeError() = %v, want nil", got)
+	}
+}
+
+func TestDualStackReportsPinholeLeftOpenWhenRollbackFails(t *testing.T) {
+	// The IPv4 mapping fails, so the pinhole is rolled back, and the rollback
+	// fails too. The pinhole is still open, and saying it was closed would be
+	// a lie the caller cannot check.
+	deleteErr := errors.New("IPv6 delete failed")
+	ipv6 := &fakePCPMapper{deleteErr: deleteErr}
+	gateway := newNATWithPCPIPv6(&fakeNAT{addErr: errors.New("IPv4 mapping failed")}, ipv6)
+
+	if _, err := gateway.AddPortMapping(context.Background(), "tcp", 1234, "test", time.Minute); err == nil {
+		t.Fatal("AddPortMapping() error = nil, want the IPv4 failure")
+	}
+
+	got := gateway.(IPv6PinholeReporter).IPv6PinholeError()
+	if !errors.Is(got, errPinholeLeftOpen) {
+		t.Fatalf("IPv6PinholeError() = %v, want it to report the pinhole left open", got)
+	}
+	if !errors.Is(got, deleteErr) {
+		t.Fatalf("IPv6PinholeError() = %v, want it to carry %v", got, deleteErr)
+	}
+}
+
+func TestDualStackReportsPinholeRolledBack(t *testing.T) {
+	ipv6 := &fakePCPMapper{}
+	gateway := newNATWithPCPIPv6(&fakeNAT{addErr: errors.New("IPv4 mapping failed")}, ipv6)
+
+	if _, err := gateway.AddPortMapping(context.Background(), "tcp", 1234, "test", time.Minute); err == nil {
+		t.Fatal("AddPortMapping() error = nil, want the IPv4 failure")
+	}
+
+	got := gateway.(IPv6PinholeReporter).IPv6PinholeError()
+	if !errors.Is(got, errPinholeRolledBack) {
+		t.Fatalf("IPv6PinholeError() = %v, want it to report the rollback", got)
 	}
 }
 

@@ -22,6 +22,9 @@ type fakePCPServer struct {
 	// corruptNext truncates the next MAP response: the server creates the
 	// mapping but the client cannot parse the reply.
 	corruptNext bool
+	// refuseDeletes answers every zero-lifetime MAP with NO_RESOURCES and
+	// keeps the mapping, standing in for a server that will not release one.
+	refuseDeletes bool
 }
 
 func newFakePCPServer(t *testing.T, network, addr string) *fakePCPServer {
@@ -96,6 +99,10 @@ func (s *fakePCPServer) handle(req []byte) []byte {
 			return resp
 		}
 		if lifetime == 0 {
+			if s.refuseDeletes {
+				resp[3] = ResultNoResources
+				return resp
+			}
 			delete(s.mappings, key)
 		} else {
 			s.mappings[key] = nonce

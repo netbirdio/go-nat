@@ -14,9 +14,14 @@ import (
 // IPv4 mapping, which deliberately outlives the caller's context.
 const pinholeRollbackTimeout = 3 * time.Second
 
-// errPinholeRolledBack marks a pinhole that was opened and then closed again
-// because the IPv4 mapping it accompanied failed.
-var errPinholeRolledBack = errors.New("rolled back after the IPv4 mapping failed")
+var (
+	// errPinholeRolledBack marks a pinhole that was opened and then closed
+	// again because the IPv4 mapping it accompanied failed.
+	errPinholeRolledBack = errors.New("rolled back after the IPv4 mapping failed")
+	// errPinholeLeftOpen marks a pinhole that the rollback failed to close, so
+	// it stays open until its lifetime expires.
+	errPinholeLeftOpen = errors.New("left open after the IPv4 mapping failed")
+)
 
 // pcpIPv6Client is the part of pcp.Client needed for IPv6 pinholes. The
 // interface keeps dual-stack behavior testable without network access.
@@ -79,18 +84,24 @@ func (n *natWithPCPIPv6) AddPortMapping(ctx context.Context, protocol string, in
 	<-pcp6Done
 
 	if err != nil && pcp6Err == nil {
-		// The caller sees a failed mapping and will never delete it, so close
-		// the pinhole rather than leaking it until its lifetime expires.
-		// Detached from ctx because the IPv4 failure may be the caller's
-		// deadline expiring.
-		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pinholeRollbackTimeout)
-		defer cancel()
-		_ = n.pcp6.DeletePortMapping(closeCtx, protocol, internalPort)
 		pcp6Err = errPinholeRolledBack
+		if rollbackErr := n.rollbackPinhole(ctx, protocol, internalPort); rollbackErr != nil {
+			pcp6Err = fmt.Errorf("%w: %w", errPinholeLeftOpen, rollbackErr)
+		}
 	}
 
 	n.setIPv6PinholeError(wrapPinholeErr(pcp6Err))
 	return port, err
+}
+
+// rollbackPinhole closes a pinhole opened alongside an IPv4 mapping that then
+// failed: the caller sees a failed mapping and will never delete it, so the
+// pinhole would leak until its lifetime expires. Detached from ctx because the
+// IPv4 failure may be the caller's deadline expiring.
+func (n *natWithPCPIPv6) rollbackPinhole(ctx context.Context, protocol string, internalPort int) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pinholeRollbackTimeout)
+	defer cancel()
+	return n.pcp6.DeletePortMapping(ctx, protocol, internalPort)
 }
 
 func (n *natWithPCPIPv6) DeletePortMapping(ctx context.Context, protocol string, internalPort int) error {

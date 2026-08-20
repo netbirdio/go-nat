@@ -43,6 +43,49 @@ func TestAddPortMappingRollsBackIPv6OnIPv4Failure(t *testing.T) {
 	if server6.hasMapping(ProtoTCP, 1234) {
 		t.Fatal("v6 pinhole still open after failed v4 mapping")
 	}
+	if err := nat.IPv6PinholeError(); !errors.Is(err, errPinholeRolledBack) {
+		t.Fatalf("IPv6PinholeError() = %v, want it to report the rollback", err)
+	}
+}
+
+// When the rollback itself fails the pinhole stays open, so reporting that it
+// was closed would be a lie the caller cannot check.
+func TestAddPortMappingReportsPinholeLeftOpen(t *testing.T) {
+	server4 := newFakePCPServer(t, "udp4", "127.0.0.1:5351")
+	server6 := newFakePCPServer(t, "udp6", "[::1]:5351")
+
+	// A foreign nonce fails the v4 MAP with NOT_AUTHORIZED. The v6 pinhole
+	// opens, but the server then refuses to release it.
+	server4.mu.Lock()
+	server4.mappings[mappingKey{proto: ProtoTCP, port: 1234}] = [12]byte{1}
+	server4.mu.Unlock()
+	server6.mu.Lock()
+	server6.refuseDeletes = true
+	server6.mu.Unlock()
+
+	client := NewClient(net.ParseIP("127.0.0.1"))
+	client.SetLocalIP(net.ParseIP("127.0.0.1"))
+	client6 := NewClient(net.ParseIP("::1"))
+	client6.SetLocalIP(net.ParseIP("::1"))
+	nat := &NAT{client: client, client6: client6}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := nat.AddPortMapping(ctx, "tcp", 1234, "", time.Minute); err == nil {
+		t.Fatal("AddPortMapping() error = nil, want v4 NOT_AUTHORIZED")
+	}
+
+	pinholeErr := nat.IPv6PinholeError()
+	if !errors.Is(pinholeErr, errPinholeLeftOpen) {
+		t.Fatalf("IPv6PinholeError() = %v, want it to report the pinhole left open", pinholeErr)
+	}
+	var pcpErr *Error
+	if !errors.As(pinholeErr, &pcpErr) || pcpErr.Code != ResultNoResources {
+		t.Fatalf("IPv6PinholeError() = %v, want it to carry the delete failure", pinholeErr)
+	}
+	if !server6.hasMapping(ProtoTCP, 1234) {
+		t.Fatal("fake server released a pinhole it refused to delete")
+	}
 }
 
 // A failing v6 pinhole must not fail the call, since the IPv4 mapping the

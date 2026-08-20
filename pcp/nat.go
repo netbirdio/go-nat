@@ -18,6 +18,9 @@ var (
 	// errPinholeRolledBack marks a pinhole that was opened and then closed
 	// again because the IPv4 mapping it accompanied failed.
 	errPinholeRolledBack = errors.New("rolled back after the IPv4 mapping failed")
+	// errPinholeLeftOpen marks a pinhole that the rollback failed to close, so
+	// it stays open until its lifetime expires.
+	errPinholeLeftOpen = errors.New("left open after the IPv4 mapping failed")
 )
 
 type natInterface interface {
@@ -141,8 +144,10 @@ func (n *NAT) AddPortMapping(ctx context.Context, protocol string, internalPort 
 	}
 	if err != nil {
 		if err6 == nil && client6 != nil {
-			rollbackPinhole(ctx, client6, protocol, internalPort)
 			err6 = errPinholeRolledBack
+			if rollbackErr := rollbackPinhole(ctx, client6, protocol, internalPort); rollbackErr != nil {
+				err6 = fmt.Errorf("%w: %w", errPinholeLeftOpen, rollbackErr)
+			}
 		}
 		n.setPinholeErr(err6)
 		return 0, fmt.Errorf("add mapping: %w", err)
@@ -156,10 +161,10 @@ func (n *NAT) AddPortMapping(ctx context.Context, protocol string, internalPort 
 // mapping: the caller sees a failed mapping and will never delete it, so the
 // pinhole would leak until its lifetime expires. Detached from ctx because the
 // IPv4 failure may be the caller's deadline expiring.
-func rollbackPinhole(ctx context.Context, client6 *Client, protocol string, internalPort int) {
+func rollbackPinhole(ctx context.Context, client6 *Client, protocol string, internalPort int) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultTimeout)
 	defer cancel()
-	_ = client6.DeletePortMapping(ctx, protocol, internalPort)
+	return client6.DeletePortMapping(ctx, protocol, internalPort)
 }
 
 // DeletePortMapping removes the IPv4 mapping and, when present, the IPv6
