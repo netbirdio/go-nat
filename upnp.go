@@ -30,6 +30,10 @@ const (
 	defaultHTTPPort = "80"
 )
 
+// deviceTimeout bounds a call to the gateway made by a NAT interface method
+// that takes no context of its own.
+const deviceTimeout = 10 * time.Second
+
 // upnpDiscovery names how a UPnP device was found. It ends up in the NAT type,
 // which is what callers log.
 type upnpDiscovery string
@@ -466,7 +470,7 @@ func newUPNPNAT(client upnp_NAT_Client, typ string, root *goupnp.RootDevice) *up
 }
 
 func (u *upnp_NAT) GetExternalAddress() (addr net.IP, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), deviceTimeout)
 	defer cancel()
 
 	ipString, err := u.c.GetExternalIPAddressCtx(ctx)
@@ -499,7 +503,7 @@ func (u *upnp_NAT) AddPortMapping(ctx context.Context, protocol string, internal
 		return 0, err
 	}
 
-	ip, err := u.GetInternalAddress()
+	ip, err := u.internalAddress(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("get internal address: %w", err)
 	}
@@ -563,17 +567,23 @@ func (u *upnp_NAT) GetDeviceAddress() (net.IP, error) {
 	return addr.IP, nil
 }
 
-// GetInternalAddress returns the local address the gateway sees us on. It asks
-// the routing table which source address would be used to reach the device,
-// which picks the right one when several interfaces share a subnet with it.
+// GetInternalAddress returns the local address the gateway sees us on. The NAT
+// interface takes no context here, so it applies its own timeout; callers that
+// have one reach internalAddress directly.
 func (u *upnp_NAT) GetInternalAddress() (net.IP, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), deviceTimeout)
+	defer cancel()
+	return u.internalAddress(ctx)
+}
+
+// internalAddress asks the routing table which source address would be used to
+// reach the device, which picks the right one when several interfaces share a
+// subnet with it.
+func (u *upnp_NAT) internalAddress(ctx context.Context) (net.IP, error) {
 	host, err := deviceHostPort(u.rootDevice)
 	if err != nil {
 		return nil, err
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "udp", host)
