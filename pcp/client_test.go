@@ -25,8 +25,16 @@ type fakePCPServer struct {
 	// refuseDeletes answers every zero-lifetime MAP with NO_RESOURCES and
 	// keeps the mapping, standing in for a server that will not release one.
 	refuseDeletes bool
+	// silent drops every request, standing in for a gateway that advertised
+	// PCP and then stopped answering.
+	silent bool
 }
 
+// newFakePCPServer binds a fake server on addr, which must use the well-known
+// PCP port: Client always sends there, and the discovery tests build their
+// clients inside the package, so the port cannot be overridden per test. These
+// tests therefore need port 5351 free on the host running them, which rules out
+// a machine already running a PCP or NAT-PMP responder.
 func newFakePCPServer(t *testing.T, network, addr string) *fakePCPServer {
 	t.Helper()
 	udpAddr, err := net.ResolveUDPAddr(network, addr)
@@ -59,6 +67,13 @@ func (s *fakePCPServer) serve() {
 
 func (s *fakePCPServer) handle(req []byte) []byte {
 	if len(req) < headerSize || req[0] != Version {
+		return nil
+	}
+
+	s.mu.Lock()
+	silent := s.silent
+	s.mu.Unlock()
+	if silent {
 		return nil
 	}
 

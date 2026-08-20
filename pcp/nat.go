@@ -9,6 +9,17 @@ import (
 	"time"
 )
 
+// externalAddressTimeout bounds GetExternalAddress, which the NAT interface
+// gives no context of its own.
+const externalAddressTimeout = 10 * time.Second
+
+// pinholeTimeout bounds every best-effort IPv6 pinhole operation. The IPv4
+// mapping is what the caller asked for, and it waits on the pinhole so the
+// outcome can be reported, so an unresponsive IPv6 server must not hold it for
+// the full RFC 6887 §8.1.1 mapping schedule. It is a variable so tests can
+// shorten it.
+var pinholeTimeout = 5 * time.Second
+
 var (
 	// ErrNoNATFound is returned when no PCP-capable gateway can be found.
 	ErrNoNATFound = errors.New("no NAT found")
@@ -64,29 +75,47 @@ func (n *NAT) Type() string {
 }
 
 // primary returns the IPv4 client when present, falling back to the IPv6
-// client for v6-only discovery.
-func (n *NAT) primary() *Client {
+// client for v6-only discovery. Discovery always leaves at least one of the
+// two set, so a nil result means the NAT was built by hand.
+func (n *NAT) primary() (*Client, error) {
 	if n.client != nil {
-		return n.client
+		return n.client, nil
 	}
-	return n.client6
+	if n.client6 != nil {
+		return n.client6, nil
+	}
+	return nil, ErrNoNATFound
 }
 
 // GetDeviceAddress returns the gateway IP address.
 func (n *NAT) GetDeviceAddress() (net.IP, error) {
-	return n.primary().Gateway(), nil
+	client, err := n.primary()
+	if err != nil {
+		return nil, err
+	}
+	return client.Gateway(), nil
 }
 
 // GetExternalAddress returns the external IP address.
 func (n *NAT) GetExternalAddress() (net.IP, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	client, err := n.primary()
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), externalAddressTimeout)
 	defer cancel()
-	return n.primary().GetExternalAddress(ctx)
+	return client.GetExternalAddress(ctx)
 }
 
 // GetInternalAddress returns the local IP address used to communicate with the gateway.
 func (n *NAT) GetInternalAddress() (net.IP, error) {
-	addr, err := n.primary().getLocalIP()
+	client, err := n.primary()
+	if err != nil {
+		return nil, err
+	}
+
+	addr, err := client.getLocalIP()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNoInternalAddress, err)
 	}
@@ -134,7 +163,9 @@ func (n *NAT) AddPortMapping(ctx context.Context, protocol string, internalPort 
 		client6Done = make(chan struct{})
 		go func() {
 			defer close(client6Done)
-			_, err6 = client6.AddPortMapping(ctx, protocol, internalPort, timeout)
+			pinholeCtx, cancel := context.WithTimeout(ctx, pinholeTimeout)
+			defer cancel()
+			_, err6 = client6.AddPortMapping(pinholeCtx, protocol, internalPort, timeout)
 		}()
 	}
 
@@ -162,7 +193,7 @@ func (n *NAT) AddPortMapping(ctx context.Context, protocol string, internalPort 
 // pinhole would leak until its lifetime expires. Detached from ctx because the
 // IPv4 failure may be the caller's deadline expiring.
 func rollbackPinhole(ctx context.Context, client6 *Client, protocol string, internalPort int) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pinholeTimeout)
 	defer cancel()
 	return client6.DeletePortMapping(ctx, protocol, internalPort)
 }
@@ -187,7 +218,9 @@ func (n *NAT) DeletePortMapping(ctx context.Context, protocol string, internalPo
 		client6Done = make(chan struct{})
 		go func() {
 			defer close(client6Done)
-			err6 = n.client6.DeletePortMapping(ctx, protocol, internalPort)
+			pinholeCtx, cancel := context.WithTimeout(ctx, pinholeTimeout)
+			defer cancel()
+			err6 = n.client6.DeletePortMapping(pinholeCtx, protocol, internalPort)
 		}()
 	}
 
@@ -210,7 +243,11 @@ func (n *NAT) DeletePortMapping(ctx context.Context, protocol string, internalPo
 // unreachable server is not evidence that it restarted, and reporting a
 // restart would recreate a mapping that is very likely fine.
 func (n *NAT) CheckServerHealth(ctx context.Context) (epoch uint32, serverRestarted bool, err error) {
-	client := n.primary()
+	client, err := n.primary()
+	if err != nil {
+		return 0, false, err
+	}
+
 	epoch, err = client.Announce(ctx)
 	restarted := err == nil && client.EpochStateLost()
 

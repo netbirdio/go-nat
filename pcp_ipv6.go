@@ -10,9 +10,12 @@ import (
 	"github.com/libp2p/go-nat/pcp"
 )
 
-// pinholeRollbackTimeout bounds the pinhole cleanup that runs after a failed
-// IPv4 mapping, which deliberately outlives the caller's context.
-const pinholeRollbackTimeout = 3 * time.Second
+// pinholeTimeout bounds every best-effort IPv6 pinhole operation. The IPv4
+// mapping is what the caller asked for, and it waits on the pinhole so the
+// outcome can be reported, so an unresponsive IPv6 server must not hold it for
+// the full RFC 6887 mapping retry schedule. It is a variable so tests can
+// shorten it.
+var pinholeTimeout = 5 * time.Second
 
 var (
 	// errPinholeRolledBack marks a pinhole that was opened and then closed
@@ -77,7 +80,9 @@ func (n *natWithPCPIPv6) AddPortMapping(ctx context.Context, protocol string, in
 	var pcp6Err error
 	go func() {
 		defer close(pcp6Done)
-		_, pcp6Err = n.pcp6.AddPortMapping(ctx, protocol, internalPort, timeout)
+		pinholeCtx, cancel := context.WithTimeout(ctx, pinholeTimeout)
+		defer cancel()
+		_, pcp6Err = n.pcp6.AddPortMapping(pinholeCtx, protocol, internalPort, timeout)
 	}()
 
 	port, err := n.NAT.AddPortMapping(ctx, protocol, internalPort, description, timeout)
@@ -99,7 +104,7 @@ func (n *natWithPCPIPv6) AddPortMapping(ctx context.Context, protocol string, in
 // pinhole would leak until its lifetime expires. Detached from ctx because the
 // IPv4 failure may be the caller's deadline expiring.
 func (n *natWithPCPIPv6) rollbackPinhole(ctx context.Context, protocol string, internalPort int) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pinholeRollbackTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pinholeTimeout)
 	defer cancel()
 	return n.pcp6.DeletePortMapping(ctx, protocol, internalPort)
 }
@@ -109,7 +114,9 @@ func (n *natWithPCPIPv6) DeletePortMapping(ctx context.Context, protocol string,
 	var pcp6Err error
 	go func() {
 		defer close(pcp6Done)
-		pcp6Err = n.pcp6.DeletePortMapping(ctx, protocol, internalPort)
+		pinholeCtx, cancel := context.WithTimeout(ctx, pinholeTimeout)
+		defer cancel()
+		pcp6Err = n.pcp6.DeletePortMapping(pinholeCtx, protocol, internalPort)
 	}()
 
 	err := n.NAT.DeletePortMapping(ctx, protocol, internalPort)

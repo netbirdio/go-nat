@@ -156,6 +156,48 @@ func TestCheckServerHealthAnnouncesBothStacks(t *testing.T) {
 	}
 }
 
+// A successful IPv4 mapping must not wait out an unresponsive IPv6 server.
+// Unbounded, the pinhole runs the full RFC 6887 §8.1.1 schedule and holds the
+// mapping the caller actually asked for behind it for about 30 seconds.
+func TestAddPortMappingDoesNotWaitOutAnUnresponsiveIPv6Server(t *testing.T) {
+	newFakePCPServer(t, "udp4", "127.0.0.1:5351")
+	server6 := newFakePCPServer(t, "udp6", "[::1]:5351")
+	server6.mu.Lock()
+	server6.silent = true
+	server6.mu.Unlock()
+
+	restore := pinholeTimeout
+	pinholeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { pinholeTimeout = restore })
+
+	client := NewClient(net.ParseIP("127.0.0.1"))
+	client.SetLocalIP(net.ParseIP("127.0.0.1"))
+	client6 := NewClient(net.ParseIP("::1"))
+	client6.SetLocalIP(net.ParseIP("::1"))
+	nat := &NAT{client: client, client6: client6}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := nat.AddPortMapping(ctx, "tcp", 1234, "", time.Minute); err != nil {
+			t.Errorf("AddPortMapping() error = %v, want the IPv4 mapping to succeed", err)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("AddPortMapping is still waiting on the IPv6 pinhole")
+	}
+
+	if err := nat.IPv6PinholeError(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("IPv6PinholeError() = %v, want the pinhole deadline", err)
+	}
+}
+
 // A PCP-capable IPv6 gateway must be usable even when IPv4 discovery fails:
 // v6-only networks still need firewall pinholes.
 func TestDiscoverPCPIPv6WithoutIPv4(t *testing.T) {

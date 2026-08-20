@@ -40,20 +40,27 @@ func (n *fakeNAT) DeletePortMapping(context.Context, string, int) error {
 }
 
 type fakePCPMapper struct {
-	addErr      error
-	deleteErr   error
-	addStarted  chan struct{}
-	announceErr error
-	epochLost   bool
-	adds        int
-	deletes     int
-	announces   int
+	addErr error
+	// unresponsive makes AddPortMapping block until its context ends, standing
+	// in for a PCP server that never answers.
+	unresponsive bool
+	deleteErr    error
+	addStarted   chan struct{}
+	announceErr  error
+	epochLost    bool
+	adds         int
+	deletes      int
+	announces    int
 }
 
-func (m *fakePCPMapper) AddPortMapping(context.Context, string, int, time.Duration) (*pcp.MapResponse, error) {
+func (m *fakePCPMapper) AddPortMapping(ctx context.Context, _ string, _ int, _ time.Duration) (*pcp.MapResponse, error) {
 	m.adds++
 	if m.addStarted != nil {
 		close(m.addStarted)
+	}
+	if m.unresponsive {
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	return nil, m.addErr
 }
@@ -63,9 +70,13 @@ func (m *fakePCPMapper) DeletePortMapping(context.Context, string, int) error {
 	return m.deleteErr
 }
 
+// fakePCPEpoch is what fakePCPMapper reports, distinct from the IPv4 epoch so
+// that tests can tell which stack an epoch came from.
+const fakePCPEpoch = 42
+
 func (m *fakePCPMapper) Announce(context.Context) (uint32, error) {
 	m.announces++
-	return 42, m.announceErr
+	return fakePCPEpoch, m.announceErr
 }
 
 func (m *fakePCPMapper) EpochStateLost() bool { return m.epochLost }
@@ -254,6 +265,36 @@ func TestDualStackReportsPinholeLeftOpenWhenRollbackFails(t *testing.T) {
 	}
 }
 
+func TestDualStackMappingDoesNotWaitOutAnUnresponsiveIPv6Server(t *testing.T) {
+	// Without a bound, the pinhole runs the full RFC 6887 retry schedule and a
+	// perfectly good IPv4 mapping waits ~30s behind it.
+	restore := pinholeTimeout
+	pinholeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { pinholeTimeout = restore })
+
+	ipv6 := &fakePCPMapper{unresponsive: true}
+	gateway := newNATWithPCPIPv6(&fakeNAT{port: 4242}, ipv6)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		port, err := gateway.AddPortMapping(context.Background(), "tcp", 1234, "test", time.Minute)
+		if port != 4242 || err != nil {
+			t.Errorf("AddPortMapping() = (%d, %v), want (4242, nil)", port, err)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("AddPortMapping is still waiting on the IPv6 pinhole")
+	}
+
+	if got := gateway.(IPv6PinholeReporter).IPv6PinholeError(); !errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("IPv6PinholeError() = %v, want the pinhole deadline", got)
+	}
+}
+
 func TestDualStackReportsPinholeRolledBack(t *testing.T) {
 	ipv6 := &fakePCPMapper{}
 	gateway := newNATWithPCPIPv6(&fakeNAT{addErr: errors.New("IPv4 mapping failed")}, ipv6)
@@ -280,6 +321,7 @@ func TestDualStackHealthCheck(t *testing.T) {
 		name          string
 		ipv4          NAT
 		ipv6          *fakePCPMapper
+		wantEpoch     uint32
 		wantRestarted bool
 		wantErr       bool
 	}{
@@ -288,24 +330,28 @@ func TestDualStackHealthCheck(t *testing.T) {
 			ipv4: &fakeHealthCheckedNAT{epoch: 7},
 			ipv6: &fakePCPMapper{epochLost: true},
 			// The pinhole is gone even though the IPv4 gateway is healthy.
+			wantEpoch:     7,
 			wantRestarted: true,
 		},
 		{
 			name:          "IPv4 restart alone forces a remap",
 			ipv4:          &fakeHealthCheckedNAT{epoch: 7, restarted: true},
 			ipv6:          &fakePCPMapper{},
+			wantEpoch:     7,
 			wantRestarted: true,
 		},
 		{
-			name: "neither stack restarted",
-			ipv4: &fakeHealthCheckedNAT{epoch: 7},
-			ipv6: &fakePCPMapper{},
+			name:      "neither stack restarted",
+			ipv4:      &fakeHealthCheckedNAT{epoch: 7},
+			ipv6:      &fakePCPMapper{},
+			wantEpoch: 7,
 		},
 		{
 			name: "fallback IPv4 cannot report health, IPv6 still can",
 			ipv4: &fakeNAT{typ: "UPnP"},
 			ipv6: &fakePCPMapper{epochLost: true},
-			// A UPnP gateway has no epoch, so the pinhole is the only signal.
+			// A UPnP gateway has no epoch, so the IPv6 one is reported instead.
+			wantEpoch:     fakePCPEpoch,
 			wantRestarted: true,
 		},
 		{
@@ -313,6 +359,7 @@ func TestDualStackHealthCheck(t *testing.T) {
 			ipv4: &fakeHealthCheckedNAT{healthErr: errors.New("unreachable")},
 			ipv6: &fakePCPMapper{epochLost: true},
 			// The IPv6 verdict stands; the unreachable IPv4 server says nothing.
+			wantEpoch:     fakePCPEpoch,
 			wantRestarted: true,
 		},
 		{
@@ -330,9 +377,12 @@ func TestDualStackHealthCheck(t *testing.T) {
 				t.Fatal("dual-stack gateway does not implement HealthChecker")
 			}
 
-			_, restarted, err := gateway.CheckServerHealth(context.Background())
+			epoch, restarted, err := gateway.CheckServerHealth(context.Background())
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("CheckServerHealth() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if epoch != tt.wantEpoch {
+				t.Fatalf("epoch = %d, want %d", epoch, tt.wantEpoch)
 			}
 			if restarted != tt.wantRestarted {
 				t.Fatalf("serverRestarted = %v, want %v", restarted, tt.wantRestarted)
