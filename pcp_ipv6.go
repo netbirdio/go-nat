@@ -132,10 +132,30 @@ func (n *natWithPCPIPv6) DeletePortMapping(ctx context.Context, protocol string,
 // could be reached: one unreachable server is not evidence that it restarted,
 // and reporting a restart would recreate a mapping that is very likely fine.
 func (n *natWithPCPIPv6) CheckServerHealth(ctx context.Context) (uint32, bool, error) {
-	epoch6, err6 := n.pcp6.Announce(ctx)
-	restarted6 := err6 == nil && n.pcp6.EpochStateLost()
+	// Bounded and concurrent: announced in series on the caller's context, an
+	// unresponsive IPv6 server runs the full retry schedule and leaves nothing
+	// for the IPv4 gateway, which disables health checking altogether.
+	v6Done := make(chan struct{})
+	var epoch6 uint32
+	var err6 error
+	go func() {
+		defer close(v6Done)
+		pinholeCtx, cancel := context.WithTimeout(ctx, pinholeTimeout)
+		defer cancel()
+		epoch6, err6 = n.pcp6.Announce(pinholeCtx)
+	}()
 
 	checker, ok := n.NAT.(HealthChecker)
+	var epoch uint32
+	var restarted bool
+	var err error
+	if ok {
+		epoch, restarted, err = checker.CheckServerHealth(ctx)
+	}
+
+	<-v6Done
+	restarted6 := err6 == nil && n.pcp6.EpochStateLost()
+
 	if !ok {
 		if err6 != nil {
 			return 0, false, wrapPinholeErr(err6)
@@ -143,7 +163,6 @@ func (n *natWithPCPIPv6) CheckServerHealth(ctx context.Context) (uint32, bool, e
 		return epoch6, restarted6, nil
 	}
 
-	epoch, restarted, err := checker.CheckServerHealth(ctx)
 	switch {
 	case err != nil && err6 != nil:
 		return 0, false, fmt.Errorf("%w; %w", err, wrapPinholeErr(err6))

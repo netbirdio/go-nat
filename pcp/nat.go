@@ -248,17 +248,35 @@ func (n *NAT) CheckServerHealth(ctx context.Context) (epoch uint32, serverRestar
 		return 0, false, err
 	}
 
+	dualStack := n.client6 != nil && n.client6 != client
+
+	// Bounded and concurrent: announced in series on the caller's context, an
+	// unresponsive IPv6 server runs the full retry schedule and leaves nothing
+	// for the IPv4 gateway, which disables health checking altogether.
+	var v6Done chan struct{}
+	var epoch6 uint32
+	var err6 error
+	if dualStack {
+		v6Done = make(chan struct{})
+		go func() {
+			defer close(v6Done)
+			pinholeCtx, cancel := context.WithTimeout(ctx, pinholeTimeout)
+			defer cancel()
+			epoch6, err6 = n.client6.Announce(pinholeCtx)
+		}()
+	}
+
 	epoch, err = client.Announce(ctx)
 	restarted := err == nil && client.EpochStateLost()
 
-	if n.client6 == nil || n.client6 == client {
+	if !dualStack {
 		if err != nil {
 			return 0, false, fmt.Errorf("announce: %w", err)
 		}
 		return epoch, restarted, nil
 	}
 
-	epoch6, err6 := n.client6.Announce(ctx)
+	<-v6Done
 	restarted6 := err6 == nil && n.client6.EpochStateLost()
 
 	switch {

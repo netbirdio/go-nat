@@ -41,8 +41,8 @@ func (n *fakeNAT) DeletePortMapping(context.Context, string, int) error {
 
 type fakePCPMapper struct {
 	addErr error
-	// unresponsive makes AddPortMapping block until its context ends, standing
-	// in for a PCP server that never answers.
+	// unresponsive makes AddPortMapping and Announce block until their context
+	// ends, standing in for a PCP server that never answers.
 	unresponsive bool
 	deleteErr    error
 	addStarted   chan struct{}
@@ -74,8 +74,12 @@ func (m *fakePCPMapper) DeletePortMapping(context.Context, string, int) error {
 // that tests can tell which stack an epoch came from.
 const fakePCPEpoch = 42
 
-func (m *fakePCPMapper) Announce(context.Context) (uint32, error) {
+func (m *fakePCPMapper) Announce(ctx context.Context) (uint32, error) {
 	m.announces++
+	if m.unresponsive {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
 	return fakePCPEpoch, m.announceErr
 }
 
@@ -432,5 +436,37 @@ func TestSelectGatewayUsesFirstFallback(t *testing.T) {
 	_, err = selectGateway(context.Background(), results[NAT](), results[pcpIPv6Client](), results[NAT]())
 	if !errors.Is(err, ErrNoNATFound) {
 		t.Fatalf("empty discovery error = %v, want %v", err, ErrNoNATFound)
+	}
+}
+
+func TestDualStackHealthCheckSurvivesAnUnresponsiveIPv6Server(t *testing.T) {
+	// Announced in series on the caller's context, the IPv6 server would run
+	// the full retry schedule and leave nothing for the IPv4 gateway, so a
+	// dead pinhole server would disable health checking entirely.
+	restore := pinholeTimeout
+	pinholeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { pinholeTimeout = restore })
+
+	ipv4 := &fakeHealthCheckedNAT{epoch: 7, restarted: true}
+	gateway := newNATWithPCPIPv6(ipv4, &fakePCPMapper{unresponsive: true}).(HealthChecker)
+
+	callerBudget := 2 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), callerBudget)
+	defer cancel()
+
+	start := time.Now()
+	epoch, restarted, err := gateway.CheckServerHealth(ctx)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("CheckServerHealth() error = %v, want the IPv4 verdict to stand", err)
+	}
+	if epoch != 7 || !restarted {
+		t.Fatalf("CheckServerHealth() = (%d, %v), want (7, true)", epoch, restarted)
+	}
+	// Unbounded, the dead pinhole server holds the call for the caller's whole
+	// budget, which is the health check's only chance to run before the next tick.
+	if elapsed >= callerBudget/2 {
+		t.Fatalf("CheckServerHealth() took %v, want it bounded near %v", elapsed, pinholeTimeout)
 	}
 }
