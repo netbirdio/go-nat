@@ -28,6 +28,11 @@ type fakePCPServer struct {
 	// silent drops every request, standing in for a gateway that advertised
 	// PCP and then stopped answering.
 	silent bool
+	// gate, when non-nil, holds every request until a value is received, so a
+	// test can keep one exchange in flight while it observes the client.
+	gate chan struct{}
+	// arrivals reports each request as it reaches the server.
+	arrivals chan struct{}
 }
 
 // newFakePCPServer binds a fake server on addr, which must use the well-known
@@ -59,9 +64,14 @@ func (s *fakePCPServer) serve() {
 		if err != nil {
 			return
 		}
-		if resp := s.handle(buf[:n]); resp != nil {
-			_, _ = s.conn.WriteToUDP(resp, from)
-		}
+		// Each request is handled on its own goroutine so that gating one does
+		// not also stall the requests a test is watching for.
+		req := append([]byte(nil), buf[:n]...)
+		go func() {
+			if resp := s.handle(req); resp != nil {
+				_, _ = s.conn.WriteToUDP(resp, from)
+			}
+		}()
 	}
 }
 
@@ -71,8 +81,14 @@ func (s *fakePCPServer) handle(req []byte) []byte {
 	}
 
 	s.mu.Lock()
-	silent := s.silent
+	silent, gate, arrivals := s.silent, s.gate, s.arrivals
 	s.mu.Unlock()
+	if arrivals != nil {
+		arrivals <- struct{}{}
+	}
+	if gate != nil {
+		<-gate
+	}
 	if silent {
 		return nil
 	}
@@ -247,5 +263,59 @@ func TestSendOnceStopsOnCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("send did not stop after cancellation")
+	}
+}
+
+// A delete must not overtake a create for the same mapping. The nonce is the
+// server's identity for a mapping, so a delete completing first drops the nonce
+// the created mapping needs, stranding one no later delete can remove.
+func TestPortMappingRequestsAreSerializedPerMapping(t *testing.T) {
+	server := newFakePCPServer(t, "udp4", "127.0.0.1:5351")
+	gate := make(chan struct{})
+	arrivals := make(chan struct{}, 8)
+	server.mu.Lock()
+	server.gate, server.arrivals = gate, arrivals
+	server.mu.Unlock()
+
+	client := NewClientWithTimeout(net.IPv4(127, 0, 0, 1), 5*time.Second)
+	client.SetLocalIP(net.IPv4(127, 0, 0, 1))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	createDone := make(chan error, 1)
+	go func() {
+		_, err := client.AddPortMapping(ctx, "udp", 4447, time.Hour)
+		createDone <- err
+	}()
+
+	// Hold the create at the server.
+	select {
+	case <-arrivals:
+	case <-time.After(5 * time.Second):
+		t.Fatal("create never reached the server")
+	}
+
+	deleteDone := make(chan error, 1)
+	go func() { deleteDone <- client.DeletePortMapping(ctx, "udp", 4447) }()
+
+	// The delete must not reach the server while the create is in flight.
+	select {
+	case <-arrivals:
+		t.Fatal("delete reached the server while the create was still in flight")
+	case err := <-deleteDone:
+		t.Fatalf("delete completed before the create: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(gate)
+	if err := <-createDone; err != nil {
+		t.Fatalf("create mapping: %v", err)
+	}
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("delete mapping: %v (the create's nonce must still be held)", err)
+	}
+	if server.hasMapping(ProtoUDP, 4447) {
+		t.Fatal("mapping still present on server")
 	}
 }

@@ -41,6 +41,30 @@ type Client struct {
 	// nonces holds the nonce for each active mapping; RFC 6887 requires
 	// renewals and deletes to reuse the nonce the mapping was created with.
 	nonces map[mappingKey][12]byte
+	// mappingLocks serializes requests per mapping. The nonce is the server's
+	// identity for a mapping, so a delete completing while a create for the
+	// same key is still in flight would drop the nonce the created mapping
+	// needs, leaving one on the server that no later delete can remove.
+	mappingLocks map[mappingKey]*sync.Mutex
+}
+
+// lockMapping serializes requests for one mapping. It never holds c.mu across
+// the request itself, which would block every other operation on the client for
+// the length of a UDP exchange.
+func (c *Client) lockMapping(key mappingKey) func() {
+	c.mu.Lock()
+	lock, ok := c.mappingLocks[key]
+	if !ok {
+		lock = &sync.Mutex{}
+		if c.mappingLocks == nil {
+			c.mappingLocks = make(map[mappingKey]*sync.Mutex)
+		}
+		c.mappingLocks[key] = lock
+	}
+	c.mu.Unlock()
+
+	lock.Lock()
+	return lock.Unlock
 }
 
 type mappingKey struct {
@@ -170,6 +194,8 @@ func (c *Client) addPortMappingWithHint(ctx context.Context, protocol string, in
 	}
 
 	key := mappingKey{proto: proto, port: uint16(internalPort)}
+	defer c.lockMapping(key)()
+
 	c.mu.Lock()
 	nonce, haveNonce := c.nonces[key]
 	if !haveNonce {
