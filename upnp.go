@@ -451,13 +451,25 @@ type upnp_NAT_Client interface {
 	GetNATRSIPStatusCtx(context.Context) (bool, bool, error)
 }
 
+// upnpMappingKey identifies one mapping on the device. The protocol is part of
+// the key because a device holds independent TCP and UDP mappings for the same
+// internal port.
+type upnpMappingKey struct {
+	protocol string
+	port     uint16
+}
+
 type upnp_NAT struct {
 	c          upnp_NAT_Client
 	typ        string
 	rootDevice *goupnp.RootDevice
 
+	// mu is held across the device call and the cache update together, so that
+	// two callers cannot both miss the cache and create competing mappings, or
+	// drop a cache entry while the other is still installing it. A UPnP device
+	// answers one SOAP request at a time anyway.
 	mu    sync.Mutex
-	ports map[int]int
+	ports map[upnpMappingKey]uint16
 }
 
 func newUPNPNAT(client upnp_NAT_Client, typ string, root *goupnp.RootDevice) *upnp_NAT {
@@ -465,7 +477,7 @@ func newUPNPNAT(client upnp_NAT_Client, typ string, root *goupnp.RootDevice) *up
 		c:          client,
 		typ:        typ,
 		rootDevice: root,
-		ports:      make(map[int]int),
+		ports:      make(map[upnpMappingKey]uint16),
 	}
 }
 
@@ -509,26 +521,24 @@ func (u *upnp_NAT) AddPortMapping(ctx context.Context, protocol string, internal
 	}
 
 	timeoutInSeconds := uint32(timeout / time.Second)
+	key := upnpMappingKey{protocol: proto, port: uint16(internalPort)}
 
 	u.mu.Lock()
-	externalPort := u.ports[internalPort]
-	u.mu.Unlock()
+	defer u.mu.Unlock()
 
-	if externalPort > 0 {
-		err = u.c.AddPortMappingCtx(ctx, "", uint16(externalPort), proto, uint16(internalPort), ip.String(), true, description, timeoutInSeconds)
+	if externalPort := u.ports[key]; externalPort > 0 {
+		err = u.c.AddPortMappingCtx(ctx, "", externalPort, proto, key.port, ip.String(), true, description, timeoutInSeconds)
 		if err == nil {
-			return externalPort, nil
+			return int(externalPort), nil
 		}
 	}
 
 	for range 3 {
-		externalPort = randomPort()
-		err = u.c.AddPortMappingCtx(ctx, "", uint16(externalPort), proto, uint16(internalPort), ip.String(), true, description, timeoutInSeconds)
+		externalPort := uint16(randomPort())
+		err = u.c.AddPortMappingCtx(ctx, "", externalPort, proto, key.port, ip.String(), true, description, timeoutInSeconds)
 		if err == nil {
-			u.mu.Lock()
-			u.ports[internalPort] = externalPort
-			u.mu.Unlock()
-			return externalPort, nil
+			u.ports[key] = externalPort
+			return int(externalPort), nil
 		}
 	}
 
@@ -541,16 +551,23 @@ func (u *upnp_NAT) DeletePortMapping(ctx context.Context, protocol string, inter
 		return err
 	}
 
-	u.mu.Lock()
-	externalPort := u.ports[internalPort]
-	delete(u.ports, internalPort)
-	u.mu.Unlock()
+	key := upnpMappingKey{protocol: proto, port: uint16(internalPort)}
 
-	if externalPort == 0 {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	externalPort, ok := u.ports[key]
+	if !ok {
 		return nil
 	}
 
-	return u.c.DeletePortMappingCtx(ctx, "", uint16(externalPort), proto)
+	if err := u.c.DeletePortMappingCtx(ctx, "", externalPort, proto); err != nil {
+		return err
+	}
+	// Drop the entry only once the device confirms, so a failed delete leaves
+	// the mapping addressable for a retry instead of orphaning it.
+	delete(u.ports, key)
+	return nil
 }
 
 func (u *upnp_NAT) GetDeviceAddress() (net.IP, error) {

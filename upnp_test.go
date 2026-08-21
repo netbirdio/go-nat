@@ -1,13 +1,28 @@
 package nat
 
 import (
+	"context"
 	"errors"
+	"maps"
 	"net/netip"
 	"net/url"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/huin/goupnp"
 )
+
+// testRootDevice is a device description with a reachable base URL, which
+// AddPortMapping needs to resolve the local address.
+func testRootDevice(t *testing.T) *goupnp.RootDevice {
+	t.Helper()
+	base, err := url.Parse("http://127.0.0.1:5000/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &goupnp.RootDevice{URLBase: *base}
+}
 
 func TestLocationHasAddr(t *testing.T) {
 	gateway := netip.MustParseAddr("192.168.1.1")
@@ -120,5 +135,108 @@ func TestDeviceHostPort(t *testing.T) {
 				t.Fatalf("deviceHostPort() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// fakeUPNPClient records the mappings a device holds.
+type fakeUPNPClient struct {
+	mu       sync.Mutex
+	mappings map[string]uint16 // protocol -> external port
+	addErr   error
+	delErr   error
+	adds     int
+	deletes  int
+}
+
+func newFakeUPNPClient() *fakeUPNPClient {
+	return &fakeUPNPClient{mappings: make(map[string]uint16)}
+}
+
+func (c *fakeUPNPClient) GetExternalIPAddressCtx(context.Context) (string, error) {
+	return "203.0.113.1", nil
+}
+
+func (c *fakeUPNPClient) GetNATRSIPStatusCtx(context.Context) (bool, bool, error) {
+	return false, true, nil
+}
+
+func (c *fakeUPNPClient) AddPortMappingCtx(_ context.Context, _ string, extPort uint16, protocol string, _ uint16, _ string, _ bool, _ string, _ uint32) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.adds++
+	if c.addErr != nil {
+		return c.addErr
+	}
+	c.mappings[protocol] = extPort
+	return nil
+}
+
+func (c *fakeUPNPClient) DeletePortMappingCtx(_ context.Context, _ string, _ uint16, protocol string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deletes++
+	if c.delErr != nil {
+		return c.delErr
+	}
+	delete(c.mappings, protocol)
+	return nil
+}
+
+func (c *fakeUPNPClient) held() map[string]uint16 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return maps.Clone(c.mappings)
+}
+
+func TestUPNPKeepsTCPAndUDPMappingsApart(t *testing.T) {
+	client := newFakeUPNPClient()
+	u := newUPNPNAT(client, "test", testRootDevice(t))
+
+	ctx := context.Background()
+	if _, err := u.AddPortMapping(ctx, "udp", 51820, "wg", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.AddPortMapping(ctx, "tcp", 51820, "wg", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(client.held()); got != 2 {
+		t.Fatalf("device holds %d mappings, want 2 (TCP and UDP are independent)", got)
+	}
+
+	// Deleting one protocol must not make the other undeletable: keyed by port
+	// alone, the shared cache entry is gone and the second delete is skipped.
+	if err := u.DeletePortMapping(ctx, "udp", 51820); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.DeletePortMapping(ctx, "tcp", 51820); err != nil {
+		t.Fatal(err)
+	}
+
+	if held := client.held(); len(held) != 0 {
+		t.Fatalf("device still holds %v, want both mappings removed", held)
+	}
+}
+
+func TestUPNPKeepsMappingAddressableAfterFailedDelete(t *testing.T) {
+	client := newFakeUPNPClient()
+	u := newUPNPNAT(client, "test", testRootDevice(t))
+	ctx := context.Background()
+
+	if _, err := u.AddPortMapping(ctx, "udp", 51820, "wg", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	client.delErr = errors.New("device busy")
+	if err := u.DeletePortMapping(ctx, "udp", 51820); err == nil {
+		t.Fatal("DeletePortMapping() error = nil, want the device failure")
+	}
+
+	// The mapping is still on the device, so a retry must still address it.
+	client.delErr = nil
+	if err := u.DeletePortMapping(ctx, "udp", 51820); err != nil {
+		t.Fatal(err)
+	}
+	if held := client.held(); len(held) != 0 {
+		t.Fatalf("device still holds %v after retry", held)
 	}
 }
