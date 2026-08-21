@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/libp2p/go-nat/pcp"
+	"github.com/netbirdio/go-nat/pcp"
 )
 
 // pinholeTimeout bounds every best-effort IPv6 pinhole operation. The IPv4

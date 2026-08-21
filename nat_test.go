@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/libp2p/go-nat/pcp"
+	"github.com/netbirdio/go-nat/pcp"
 )
 
 type fakeNAT struct {

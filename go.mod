@@ -1,4 +1,4 @@
-module github.com/libp2p/go-nat
+module github.com/netbirdio/go-nat
 
 require (
 	github.com/google/gopacket v1.1.19
