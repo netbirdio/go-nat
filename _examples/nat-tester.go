@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/libp2p/go-nat"
+	"github.com/netbirdio/go-nat"
 )
 
 func main() {

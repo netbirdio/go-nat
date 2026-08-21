@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/libp2p/go-nat/pcp"
+	"github.com/netbirdio/go-nat/pcp"
 )
 
 // pcpProbeTimeout bounds PCP discovery. A PCP server sits on the local link
